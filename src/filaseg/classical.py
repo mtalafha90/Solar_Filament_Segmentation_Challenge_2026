@@ -49,7 +49,7 @@ class ClassicalConfig:
     before drawing conclusions -- real sunspot groups are far more irregular
     than the synthetic ones, so the ridge term is expected to matter more.
     """
-    expected_coverage: float = 0.012
+    expected_coverage: float = 0.004
     """Fraction of the solar disk expected to be covered by filament *cores*.
 
     This is the detector's one real assumption, and it is stated in physical
@@ -59,11 +59,15 @@ class ClassicalConfig:
     Final coverage is larger than this number -- see ``growth_factor``.
 
     It genuinely matters, because filament coverage varies by an order of
-    magnitude over the solar cycle: seeding 1.2% of the disk when filaments
-    actually cover 5% caps recall no matter how good the score map is.  The
-    default suits a moderately active Sun.  Measure it from the training
-    annotations instead of guessing -- ``scripts/tune_classical.py`` prints the
-    observed coverage and searches around it.
+    magnitude over the solar cycle, and seeding the wrong fraction caps either
+    recall or precision no matter how good the score map is.
+
+    The default is set for real GONG data: filaments cover about 0.84% of the
+    disk across MAGFiLO, and cores are a fraction of that again. Synthetic
+    frames from :mod:`filaseg.data.synthetic` are far denser and want a value
+    several times higher. Measure it rather than guessing --
+    ``scripts/inspect_data.py`` reports the observed coverage and
+    ``scripts/tune_classical.py`` searches around it.
     """
     growth_factor: float = 4.0
     """How far hysteresis may grow beyond the seeds, as a multiple of coverage.

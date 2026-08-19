@@ -184,3 +184,186 @@ def test_submission_preserves_string_ids(tmp_path):
 
     write_rle_csv(tmp_path / "sub.csv", [(GONG_ID, labels, None)])
     assert GONG_ID in (tmp_path / "sub.csv").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Image resolution: strictness, split disambiguation, collision detection
+# ---------------------------------------------------------------------------
+
+
+def _touch(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+
+
+def test_find_image_matches_exactly_and_by_stem(tmp_path):
+    from filaseg.data.io import find_image
+
+    _touch(tmp_path / "a.jpeg")
+    assert find_image(tmp_path, "a.jpeg").name == "a.jpeg"
+    assert find_image(tmp_path, "a.fits").name == "a.jpeg"     # format swapped
+    assert find_image(tmp_path, "train/a.jpeg").name == "a.jpeg"  # prefix dropped
+
+
+def test_find_image_does_not_search_below_by_default(tmp_path):
+    """A loose search can silently pair a mask with the wrong frame."""
+    from filaseg.data.io import find_image
+
+    _touch(tmp_path / "sub" / "b.jpeg")
+    with pytest.raises(FileNotFoundError):
+        find_image(tmp_path, "b.jpeg")
+    assert find_image(tmp_path, "b.jpeg", search_subdirectories=True).name == "b.jpeg"
+
+
+def test_find_image_raises_for_a_genuinely_absent_file(tmp_path):
+    from filaseg.data.io import find_image
+
+    _touch(tmp_path / "a.jpeg")
+    with pytest.raises(FileNotFoundError):
+        find_image(tmp_path, "definitely_not_here.jpeg")
+
+
+def test_resolve_images_reports_missing_and_collisions(tmp_path):
+    from filaseg.data.io import resolve_images
+
+    _touch(tmp_path / "x.jpeg")
+    resolved, missing, collisions = resolve_images(
+        tmp_path, ["x.jpeg", "x.fits", "gone.jpeg"]
+    )
+    assert missing == ["gone.jpeg"]
+    assert len(collisions) == 1                      # x.jpeg and x.fits collide
+    assert set(next(iter(collisions.values()))) == {"x.jpeg", "x.fits"}
+    assert len(resolved) == 2
+
+
+def test_resolve_images_disambiguates_split_prefixes(tmp_path):
+    """One annotation file covering train and test must not cross-contaminate."""
+    from filaseg.data.io import resolve_images
+
+    train = tmp_path / "train"
+    _touch(train / "x.jpeg")
+    _touch(train / "y.jpeg")
+
+    resolved, missing, collisions = resolve_images(
+        train, ["train/x.jpeg", "train/y.jpeg", "test/x.jpeg", "test/y.jpeg"]
+    )
+    assert not collisions
+    assert set(resolved) == {"train/x.jpeg", "train/y.jpeg"}
+    assert not missing
+
+
+def test_dataset_skips_records_with_no_image(tmp_path):
+    """MAGFiLO's JSON covers more observations than any one split ships."""
+    from PIL import Image
+
+    images = tmp_path / "img"
+    images.mkdir()
+    for name in ("a", "b"):
+        Image.fromarray(
+            np.random.default_rng(0).integers(0, 255, (48, 48), dtype=np.uint8)
+        ).save(images / f"{name}.jpeg")
+
+    coco = {
+        "info": {}, "licenses": [],
+        "categories": [{"id": 1, "name": "Left"}],
+        "images": [
+            {"id": n, "file_name": f"{n}.jpeg", "height": 48, "width": 48}
+            for n in ("a", "b", "c")
+        ],
+        "annotations": [
+            {"id": i, "image_id": n, "category_id": 1, "bbox": [1, 1, 6, 6],
+             "segmentation": [[1, 1, 8, 1, 8, 8]], "area": 24}
+            for i, n in enumerate(("a", "b", "c"), 1)
+        ],
+    }
+    path = tmp_path / "ann.json"
+    path.write_text(json.dumps(coco))
+
+    with pytest.warns(UserWarning, match="have no image"):
+        dataset = MagfiloDataset(path, images)
+    assert len(dataset) == 2
+    assert dataset.missing == ["c.jpeg"]
+
+
+def test_dataset_refuses_to_mispair_on_collision(tmp_path):
+    from PIL import Image
+
+    images = tmp_path / "img"
+    images.mkdir()
+    Image.fromarray(np.zeros((48, 48), dtype=np.uint8)).save(images / "a.jpeg")
+
+    coco = {
+        "info": {}, "licenses": [], "categories": [{"id": 1, "name": "Left"}],
+        # Two records, different names, both resolving to a.jpeg.
+        "images": [
+            {"id": "one", "file_name": "a.jpeg", "height": 48, "width": 48},
+            {"id": "two", "file_name": "a.fits", "height": 48, "width": 48},
+        ],
+        "annotations": [],
+    }
+    path = tmp_path / "ann.json"
+    path.write_text(json.dumps(coco))
+
+    with pytest.raises(ValueError, match="more than one annotation record"):
+        MagfiloDataset(path, images)
+
+
+def test_chirality_comes_from_magfilo_categories(tmp_path):
+    """MAGFiLO encodes chirality in the category, not a field of its own."""
+    coco = {
+        "info": {}, "licenses": [],
+        "categories": [
+            {"supercategory": "filament", "id": 1, "name": "Left"},
+            {"supercategory": "filament", "id": 2, "name": "Right"},
+            {"supercategory": "filament", "id": 3, "name": "Unidentifiable"},
+            {"supercategory": "filament", "id": 4, "name": "Ambiguous"},
+        ],
+        "images": [{"id": "f1", "file_name": "f1.jpeg", "height": 64, "width": 64}],
+        "annotations": [
+            {"id": i, "image_id": "f1", "category_id": c, "bbox": [1, 1, 5, 5],
+             "segmentation": [[1, 1, 6, 1, 6, 6]], "area": 12}
+            for i, c in enumerate((1, 1, 2, 3, 4), 1)
+        ],
+    }
+    path = tmp_path / "ann.json"
+    path.write_text(json.dumps(coco))
+
+    records, _ = load_coco(path)
+    assert summarise(records)["chirality"] == {
+        "unknown": 2, "sinistral": 2, "dextral": 1
+    }
+
+
+def test_explicit_chirality_field_still_wins(tmp_path):
+    coco = {
+        "info": {}, "licenses": [],
+        "categories": [{"id": 1, "name": "Left"}],
+        "images": [{"id": "f1", "file_name": "f1.jpeg", "height": 64, "width": 64}],
+        "annotations": [
+            {"id": 1, "image_id": "f1", "category_id": 1, "chirality": "right",
+             "bbox": [1, 1, 5, 5], "segmentation": [[1, 1, 6, 1, 6, 6]], "area": 12}
+        ],
+    }
+    path = tmp_path / "ann.json"
+    path.write_text(json.dumps(coco))
+    records, _ = load_coco(path)
+    assert records[0].annotations[0].chirality == 2
+
+
+def test_min_area_scales_with_the_solar_disk():
+    """40 pixels is a floor on a thumbnail and noise on a 2048-pixel frame."""
+    from filaseg.postprocess.instances import InstanceConfig, extract_instances
+
+    yy, xx = np.ogrid[:1024, :1024]
+    valid = ((yy - 512) ** 2 + (xx - 512) ** 2) <= 450**2
+    probability = np.zeros((1024, 1024), dtype=np.float32)
+    probability[500:504, 400:600] = 1.0   # a filament, 800 px
+    probability[700:706, 700:708] = 1.0   # noise, 48 px
+
+    scaled = extract_instances(probability, valid, InstanceConfig())
+    assert scaled.max() == 1               # noise dropped by the scaled floor
+
+    unscaled = extract_instances(
+        probability, valid, InstanceConfig(min_area_fraction=0.0)
+    )
+    assert unscaled.max() == 2             # 48 px survives a flat floor of 40

@@ -119,6 +119,13 @@ reduced 59 components to 57 without changing any metric on these frames — the
 synthetic filaments are rarely broken. It matters more on real data, where poor
 seeing genuinely fragments filaments.
 
+> The synthetic figures in this document predate the defaults being retuned for
+> real GONG statistics. Synthetic frames carry 3–7% filament coverage against
+> MAGFiLO's 0.84%, so they were produced with `expected_coverage` around 0.012;
+> the shipped default is now 0.004. On sparse GONG-scale frames the retuned
+> defaults cut the false discovery rate from 0.63 to 0.06 and raised IoU from
+> 0.651 to 0.740.
+
 ## The classical detector's coverage prior
 
 The one knob that has to be set from data. Measured on a JPEG dataset whose

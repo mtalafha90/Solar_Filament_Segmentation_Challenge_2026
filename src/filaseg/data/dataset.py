@@ -17,6 +17,7 @@ together at inference.
 from __future__ import annotations
 
 import hashlib
+import warnings
 import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ except ImportError:  # pragma: no cover - exercised only without torch
 from ..preprocessing.disk import SolarDisk
 from ..preprocessing.photometry import preprocess
 from .coco import ImageId, ImageRecord, load_coco, normalise_id, rescale_record
-from .io import find_image, read_image
+from .io import read_image, resolve_images
 from .targets import boundary_map, distance_weight, spine_heatmap
 
 # Bumped whenever the cache layout changes, so stale files are simply ignored
@@ -160,8 +161,11 @@ class MagfiloDataset:
         image_dir: str | Path,
         cache_dir: str | Path | None = None,
         image_ids: Sequence[ImageId] | None = None,
+        require_images: bool = True,
+        search_subdirectories: bool = False,
     ) -> None:
         self.image_dir = Path(image_dir)
+        self.search_subdirectories = bool(search_subdirectories)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -171,6 +175,48 @@ class MagfiloDataset:
         if image_ids is not None:
             wanted = {normalise_id(i) for i in image_ids}
             records = [r for r in records if r.image_id in wanted]
+
+        # Resolve every image up front. An annotation file routinely covers more
+        # observations than were distributed -- a competition ships one JSON and
+        # splits the frames -- so records without an image are normal and are
+        # dropped. What is never acceptable is two records resolving to the same
+        # file, because the annotations would then be paired with the wrong
+        # frame and nothing downstream could tell.
+        self.resolved: dict[str, Path] = {}
+        self.missing: list[str] = []
+        if require_images:
+            self.resolved, self.missing, collisions = resolve_images(
+                self.image_dir,
+                [record.file_name for record in records],
+                self.search_subdirectories,
+            )
+            if collisions:
+                examples = "\n  ".join(
+                    f"{path.name} <- {', '.join(repr(n) for n in names[:4])}"
+                    for path, names in list(collisions.items())[:5]
+                )
+                raise ValueError(
+                    f"{len(collisions)} image file(s) are referenced by more than one "
+                    f"annotation record. Loading these would pair masks with the "
+                    f"wrong frames, so this is refused rather than warned about."
+                    f"\n  {examples}\n"
+                    f"The annotation file most likely covers several splits whose "
+                    f"file names collide once the directory prefix is dropped. "
+                    f"Point --image-dir at the directory the names refer to, or "
+                    f"filter the annotation file to one split."
+                )
+            if self.missing:
+                kept = len(records) - len(self.missing)
+                warnings.warn(
+                    f"{len(self.missing)} of {len(records)} annotated observations "
+                    f"have no image under {self.image_dir} and were skipped "
+                    f"(for example {self.missing[0]!r}); {kept} remain. This is "
+                    f"expected when the annotation file covers more frames than "
+                    f"this split contains.",
+                    stacklevel=2,
+                )
+                records = [r for r in records if r.file_name in self.resolved]
+
         self.records = records
 
     def __len__(self) -> int:
@@ -204,7 +250,14 @@ class MagfiloDataset:
             if prepared is not None:
                 return prepared
 
-        image = read_image(find_image(self.image_dir, record.file_name))
+        path = self.resolved.get(record.file_name)
+        if path is None:
+            from .io import find_image
+
+            path = find_image(
+                self.image_dir, record.file_name, self.search_subdirectories
+            )
+        image = read_image(path)
         if record.height == 0 or record.width == 0:
             record.height, record.width = image.shape
         elif (record.height, record.width) != image.shape:

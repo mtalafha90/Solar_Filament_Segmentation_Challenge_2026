@@ -26,7 +26,7 @@ import _bootstrap  # noqa: F401
 import numpy as np
 
 from filaseg.data.coco import CHIRALITY_NAMES, load_coco, rescale_record, summarise
-from filaseg.data.io import find_image, read_image
+from filaseg.data.io import find_image, read_image, resolve_images
 from filaseg.data.layout import DATA_SUFFIXES as SUFFIXES
 from filaseg.data.layout import count_images, discover, resolve_annotations
 from filaseg.preprocessing.photometry import preprocess
@@ -89,36 +89,64 @@ def main() -> None:
         print(f"  {key:28s} {value}")
     print(f"  chirality: {stats['chirality']}")
 
-    # Check every referenced image resolves, and that sizes agree.
+    # Check that every referenced image resolves, that no two records claim the
+    # same file, and that images and annotations agree on size.
     print("\n" + "=" * 66)
     print("INTEGRITY")
     print("=" * 66)
-    missing: list[str] = []
+
+    resolved, missing, collisions = resolve_images(
+        image_dir, [record.file_name for record in records]
+    )
+
+    print(f"  annotation records          {len(records)}")
+    print(f"  image files in {str(image_dir)[-28:]:<28} {len(train_images)}")
+    print(f"  records resolved to an image {len(resolved)}")
+    print(f"  records with no image        {len(missing)}")
+    for name in missing[:3]:
+        print(f"    - {name}")
+    if len(missing) > 3:
+        print(f"    ... and {len(missing) - 3} more")
+
+    if missing:
+        print("\n  This is normal: the annotation file covers more observations")
+        print("  than this split contains. Those records are skipped on load.")
+
+    if collisions:
+        print(f"\n  ERROR: {len(collisions)} image file(s) are claimed by more than")
+        print("  one record. Annotations would be paired with the wrong frame.")
+        for path, names in list(collisions.items())[:3]:
+            print(f"    - {path.name} <- {', '.join(names[:3])}")
+    else:
+        print("  no two records resolve to the same file")
+
     mismatched: list[tuple[str, tuple, tuple]] = []
     shapes: Counter = Counter()
-
+    unreadable: list[str] = []
+    sampled = 0
     for record in records:
-        try:
-            path = find_image(image_dir, record.file_name)
-        except FileNotFoundError:
-            missing.append(record.file_name)
+        if sampled >= args.sample:
+            break
+        path = resolved.get(record.file_name)
+        if path is None:
             continue
-        if len(shapes) < args.sample or record is records[-1]:
-            try:
-                image = read_image(path)
-            except Exception as error:  # noqa: BLE001 - report, do not crash
-                missing.append(f"{record.file_name} (unreadable: {error})")
-                continue
-            shapes[image.shape] += 1
-            if (record.height, record.width) not in ((0, 0), image.shape):
-                mismatched.append(
-                    (record.file_name, (record.height, record.width), image.shape)
-                )
+        sampled += 1
+        try:
+            image = read_image(path)
+        except Exception as error:  # noqa: BLE001 - report, do not crash
+            unreadable.append(f"{record.file_name} ({error})")
+            continue
+        shapes[image.shape] += 1
+        if (record.height, record.width) not in ((0, 0), image.shape):
+            mismatched.append(
+                (record.file_name, (record.height, record.width), image.shape)
+            )
 
-    print(f"  images referenced but not found: {len(missing)}")
-    for name in missing[:5]:
-        print(f"    - {name}")
-    print(f"  image shapes seen: {dict(shapes)}")
+    print(f"\n  image shapes, from {sampled} sampled: {dict(shapes)}")
+    if unreadable:
+        print(f"  unreadable images: {len(unreadable)}")
+        for name in unreadable[:3]:
+            print(f"    - {name}")
     if mismatched:
         print(f"\n  WARNING: {len(mismatched)} size mismatch(es) between annotations "
               f"and images.")
@@ -136,12 +164,13 @@ def main() -> None:
     coverage: list[float] = []
     radii: list[float] = []
     counts: list[int] = []
-    sample = records[: max(1, args.sample)]
+    usable = [r for r in records if r.file_name in resolved]
+    sample = usable[: max(1, args.sample)]
 
     for record in sample:
         try:
-            image = read_image(find_image(image_dir, record.file_name))
-        except FileNotFoundError:
+            image = read_image(resolved[record.file_name])
+        except (FileNotFoundError, ValueError):
             continue
         if (record.height, record.width) != image.shape:
             rescale_record(record, image.shape[0], image.shape[1])
@@ -152,13 +181,16 @@ def main() -> None:
         counts.append(len(record.annotations))
 
     report: dict = {
+        "n_records": len(records),
+        "n_records_resolved": len(resolved),
+        "n_records_without_image": len(missing),
+        "n_collisions": len(collisions),
         "annotations": str(annotations),
         "image_dir": str(image_dir),
         "test_dir": str(test_dir) if test_dir else None,
         "n_train_images": len(train_images),
         "n_test_images": len(test_images),
         "image_shapes": {str(k): v for k, v in shapes.items()},
-        "n_missing_images": len(missing),
         "n_size_mismatches": len(mismatched),
         **{k: v for k, v in stats.items() if k != "chirality"},
         "chirality": stats["chirality"],
@@ -205,6 +237,10 @@ def main() -> None:
         radius = float(np.mean(radii))
         tile = 512 if radius > 700 else 256
         print(f"  network            : patch_size = {tile}, val_tile = {tile}")
+        disk_area = np.pi * radius**2
+        print(f"  post-processing    : min_area resolves to "
+              f"{max(40, int(round(1.2e-4 * disk_area)))} px at this resolution")
+        report["suggested_min_area"] = max(40, int(round(1.2e-4 * disk_area)))
         report["suggested_expected_coverage"] = centre
         report["suggested_coverage_range"] = [low, high]
         report["suggested_pos_weight"] = pos_weight

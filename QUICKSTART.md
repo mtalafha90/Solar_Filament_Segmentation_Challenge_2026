@@ -193,6 +193,19 @@ python scripts/ablation.py \
 `--annotations` straight at the file. If more than one JSON sits in the folder,
 the error lists them so you can pick.
 
+**`N of M annotated observations have no image ... and were skipped`** —
+expected. MAGFiLO's annotation file covers more observations than any one split
+ships. `inspect_data.py` shows the counts.
+
+**`image file(s) are referenced by more than one annotation record`** — two
+records would be paired with the same frame, so loading is refused rather than
+silently training on wrong masks. Point `--image-dir` at the split the names
+refer to, or filter the annotation file to one split.
+
+**The classical detector predicts far too much (high false discovery rate)** —
+its `expected_coverage` is above your data's. Run `inspect_data.py`, then
+`tune_classical.py` with the range it prints.
+
 **`no image for 'xxx.fits' under data/train`** — the JSON names files that are
 not there. The loader already tries the same stem with any known extension, so
 this means the names genuinely differ. Check `ls data/train | head`.

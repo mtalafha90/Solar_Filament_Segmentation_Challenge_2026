@@ -156,12 +156,37 @@ def test_ridge_response_prefers_ridges_over_blobs():
 
 
 def test_classical_detector_finds_synthetic_filaments(observation):
-    labels = detect(observation.image)
+    """The coverage prior has to match the data, as the documentation says.
+
+    Synthetic frames are far denser than real GONG observations -- a few per
+    cent of the disk against MAGFiLO's 0.84% -- so the default, which is set for
+    real data, under-segments them. This is the workflow the docs prescribe:
+    measure the coverage, then set the prior from it.
+    """
     _, valid, _ = preprocess(observation.image)
-    scores = evaluate(labels, observation.instance_map, valid)
+    truth = observation.instance_map
+    coverage = (observation.semantic_mask & valid).sum() / valid.sum()
+
+    labels = detect(observation.image, ClassicalConfig(expected_coverage=coverage / 3))
+    scores = evaluate(labels, truth, valid)
     assert scores["iou"] > 0.4
     assert scores["precision"] > 0.6
     assert scores["hit_rate"] > 0.3
+
+
+def test_default_coverage_prior_suits_real_gong_statistics():
+    """MAGFiLO filaments cover ~0.84% of the disk; the default targets that."""
+    from filaseg.classical import ClassicalConfig, choose_thresholds
+
+    # A uniform score map makes the percentile land exactly where the prior asks.
+    scores = np.linspace(0.0, 1.0, 100001)
+    _, high = choose_thresholds(scores, ClassicalConfig())
+    seeded = float((scores >= high).mean())
+    assert 0.002 < seeded < 0.008
+    # Hysteresis then grows several times that, landing near real coverage.
+    low, _ = choose_thresholds(scores, ClassicalConfig())
+    eligible = float((scores >= low).mean())
+    assert eligible > seeded * 2
 
 
 def test_classical_recall_improves_when_the_coverage_prior_matches():

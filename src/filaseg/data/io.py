@@ -9,6 +9,7 @@ have to care which it was given.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -85,32 +86,117 @@ def read_image(path: str | Path) -> np.ndarray:
         return _read_bitmap(path)
 
 
-def find_image(directory: str | Path, file_name: str) -> Path:
-    """Locate an image referenced by a COCO ``file_name``, tolerating format swaps.
+def find_image(
+    directory: str | Path, file_name: str, search_subdirectories: bool = False
+) -> Path:
+    """Locate an image referenced by a COCO ``file_name``.
 
     Annotation files often name a ``.fits`` frame while the distributed images
-    are ``.jpg``, or sit one directory deeper.  This looks for the exact name
-    first, then the same stem with any known image extension, then anywhere
-    below the directory.
+    are ``.jpeg``, and the ``file_name`` may carry a directory prefix that does
+    not match how the data was unpacked.  Both are handled by matching on the
+    stem.
+
+    A recursive search is *not* done by default.  It sounds helpful and is
+    dangerous: if a record's image is genuinely absent -- because the annotation
+    file covers observations that were not distributed, which is normal for a
+    competition split -- a loose search can match some other file, and the
+    record is then trained on the wrong image with no error raised. Silently
+    pairing a mask with the wrong frame is far worse than a missing file.
+
+    Args:
+        directory: Where the images live.
+        file_name: The ``file_name`` field from the annotations.
+        search_subdirectories: Also search below ``directory``, matching the
+            stem exactly. Only enable this when the images really are nested.
+
+    Returns:
+        Path to the image.
+
+    Raises:
+        FileNotFoundError: If no image matches.
     """
     directory = Path(directory)
     direct = directory / file_name
     if direct.exists():
         return direct
 
-    stem = Path(file_name).stem
-    # A FITS name like 'foo.fits' has stem 'foo'; 'foo.fits.gz' needs a second strip.
-    if stem.endswith(".fits"):
-        stem = stem[: -len(".fits")]
+    # Strip any directory prefix the annotations carry, then any FITS suffix.
+    stem = Path(file_name).name
+    for suffix in (".gz", ".fz"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+    stem = Path(stem).stem
 
-    for suffix in (*FITS_SUFFIXES, *IMAGE_SUFFIXES, ".npy"):
+    known = FITS_SUFFIXES | IMAGE_SUFFIXES | {".npy"}
+    for suffix in (*IMAGE_SUFFIXES, *FITS_SUFFIXES, ".npy"):
         candidate = directory / f"{stem}{suffix}"
         if candidate.exists():
             return candidate
 
-    matches = sorted(directory.rglob(f"{stem}.*"))
-    for match in matches:
-        if match.suffix.lower() in FITS_SUFFIXES | IMAGE_SUFFIXES | {".npy"}:
-            return match
+    if search_subdirectories:
+        for candidate in sorted(directory.rglob("*")):
+            if candidate.suffix.lower() in known and candidate.stem == stem:
+                return candidate
 
     raise FileNotFoundError(f"no image for '{file_name}' under {directory}")
+
+
+def _split_prefix(file_name: str) -> str:
+    """The directory a ``file_name`` claims to sit in, lower-cased. May be empty."""
+    parent = Path(file_name).parent
+    return "" if str(parent) in (".", "") else parent.name.lower()
+
+
+def resolve_images(
+    directory: str | Path,
+    file_names: Sequence[str],
+    search_subdirectories: bool = False,
+) -> tuple[dict[str, Path], list[str], dict[Path, list[str]]]:
+    """Resolve many ``file_name`` values at once and report what went wrong.
+
+    Two records resolving to the same file means annotations would be paired
+    with the wrong frame, which no downstream step could detect. That usually
+    happens when one annotation file covers several splits and the ``file_name``
+    fields carry a directory prefix -- ``train/x.jpeg`` and ``test/x.jpeg`` --
+    that is lost when matching on the stem. Where the prefixes make the intent
+    clear, we resolve it by keeping only the records whose prefix matches the
+    directory being read; otherwise the collision is reported.
+
+    Args:
+        directory: Where the images live.
+        file_names: The ``file_name`` fields to resolve.
+        search_subdirectories: Passed through to :func:`find_image`.
+
+    Returns:
+        ``(resolved, missing, collisions)``.  ``resolved`` maps each file name
+        that was found to its path; ``missing`` lists those that were not;
+        ``collisions`` maps any path still claimed by more than one name to the
+        names claiming it. A non-empty ``collisions`` should always be treated
+        as an error.
+    """
+    directory = Path(directory)
+
+    # If the names carry directory prefixes and one of them matches this
+    # directory, the others belong to a different split. Drop them up front.
+    target = directory.name.lower()
+    prefixes = {_split_prefix(name) for name in file_names}
+    if target in prefixes and len(prefixes - {""}) > 1:
+        file_names = [
+            name for name in file_names if _split_prefix(name) in (target, "")
+        ]
+
+    resolved: dict[str, Path] = {}
+    missing: list[str] = []
+    claimed: dict[Path, list[str]] = {}
+
+    for name in file_names:
+        try:
+            path = find_image(directory, name, search_subdirectories)
+        except FileNotFoundError:
+            missing.append(name)
+            continue
+        resolved[name] = path
+        claimed.setdefault(path.resolve(), []).append(name)
+
+    collisions = {path: names for path, names in claimed.items() if len(names) > 1}
+    return resolved, missing, collisions

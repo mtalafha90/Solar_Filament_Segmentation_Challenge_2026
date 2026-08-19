@@ -131,6 +131,13 @@ Two practical notes:
   costs about 4 MB per training image — roughly 3 GB for MAGFiLO — because it
   stores only what is expensive to recompute, at the smallest precision that
   does not lose information.
+- Component-size limits scale with the solar disk, so the same settings work
+  whether the frames are 512 or 2048 pixels across.
+- Chirality is read from MAGFiLO's `Left` / `Right` categories, not from a
+  field of its own.
+- Records whose image is not in the split are skipped with a count, and two
+  records resolving to the same file is refused outright rather than silently
+  pairing masks with the wrong frames.
 - Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
   observations by the original GONG frame name (`040301-20140609195854Bh`)
   rather than an integer, and submissions carry those names back unchanged.
@@ -268,9 +275,11 @@ amplitude is not.
 Its one real assumption is stated in physical terms rather than hidden in a
 percentile: `expected_coverage`, the fraction of the disk covered by filament
 cores. This genuinely matters, because filament coverage varies by an order of
-magnitude over the solar cycle — seeding 1.2% of the disk when filaments cover
-5% caps recall no matter how good the score map is. Measure it from your
-annotations with `scripts/tune_classical.py` rather than guessing.
+magnitude over the solar cycle, and the default is set for real GONG data,
+where MAGFiLO's filaments cover about 0.84% of the disk. Synthetic frames are
+several times denser and want a higher value. Measure it —
+`scripts/inspect_data.py` reports it and `scripts/tune_classical.py` searches
+around it — rather than guessing.
 
 > Otsu's method was tried for this and rejected. It assumes two classes of
 > comparable size, whereas filaments are a per cent or two of the disk, so it
@@ -374,7 +383,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-132 tests cover geometry, photometry, annotation parsing and encoding, the loss
+143 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

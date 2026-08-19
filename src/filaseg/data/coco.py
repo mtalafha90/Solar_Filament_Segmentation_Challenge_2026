@@ -27,6 +27,21 @@ CHIRALITY_KEYS = ("chirality", "chirality_label", "magnetic_chirality", "handedn
 
 CHIRALITY_NAMES = {0: "unknown", 1: "sinistral", 2: "dextral"}
 
+# MAGFiLO does not store chirality in a field of its own: it encodes it in the
+# COCO category, with names 'Left', 'Right', 'Unidentifiable' and 'Ambiguous'.
+# Reading only a 'chirality' key therefore reports every filament as unknown and
+# quietly throws away a label that took a thousand person-hours to produce.
+CHIRALITY_FROM_CATEGORY = {
+    "left": 1,
+    "sinistral": 1,
+    "right": 2,
+    "dextral": 2,
+    "unidentifiable": 0,
+    "ambiguous": 0,
+    "unknown": 0,
+    "filament": 0,
+}
+
 # COCO nominally uses integer ids, but real releases often do not. MAGFiLO keys
 # its observations by the original GONG frame name, for example
 # '040301-20140609195854Bh', which carries the site and timestamp. Those ids are
@@ -68,7 +83,7 @@ class FilamentAnnotation:
     area: float = 0.0
     spine: np.ndarray | None = None  # (N, 2) array of (y, x) points
     chirality: int = 0
-    category_id: int = 1
+    category_id: ImageId = 1
 
     def mask(self, height: int, width: int) -> np.ndarray:
         """Rasterise this annotation into a boolean mask."""
@@ -253,6 +268,15 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
 
     meta = {key: raw.get(key) for key in ("info", "licenses", "categories")}
 
+    # Build the category -> chirality map before reading annotations.
+    category_chirality: dict[ImageId, int] = {}
+    for category in raw.get("categories") or []:
+        name = str(category.get("name", "")).strip().lower()
+        if name in CHIRALITY_FROM_CATEGORY:
+            category_chirality[normalise_id(category.get("id"))] = (
+                CHIRALITY_FROM_CATEGORY[name]
+            )
+
     records: dict[ImageId, ImageRecord] = {}
     for entry in raw.get("images", []):
         image_id = normalise_id(entry["id"])
@@ -273,6 +297,11 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
             skipped += 1
             continue
         bbox = entry.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+        category_id = normalise_id(entry.get("category_id", 1))
+        chirality = _parse_chirality(_first_present(entry, CHIRALITY_KEYS))
+        if chirality == 0:
+            # Fall back to the category, which is where MAGFiLO keeps it.
+            chirality = category_chirality.get(category_id, 0)
         record.annotations.append(
             FilamentAnnotation(
                 annotation_id=normalise_id(
@@ -283,8 +312,8 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
                 segmentation=entry.get("segmentation"),
                 area=float(entry.get("area", 0.0)),
                 spine=_parse_spine(_first_present(entry, SPINE_KEYS)),
-                chirality=_parse_chirality(_first_present(entry, CHIRALITY_KEYS)),
-                category_id=int(entry.get("category_id", 1)),
+                chirality=chirality,
+                category_id=category_id,
             )
         )
 

@@ -33,7 +33,18 @@ class InstanceConfig:
 
     threshold: float = 0.5
     min_area: int = 40
-    """Discard components smaller than this many pixels. Scaled with resolution."""
+    """Absolute floor on component size, in pixels."""
+    min_area_fraction: float = 1.2e-4
+    """Minimum component size as a fraction of the solar disk's area.
+
+    A fixed pixel count cannot serve both a 512-pixel thumbnail and a
+    2048-pixel GONG frame: 40 pixels is a sensible floor on the first and pure
+    noise on the second, where the disk covers 2.6 million pixels and an average
+    filament runs to a few thousand. The effective threshold is therefore the
+    larger of ``min_area`` and this fraction of the disk, whenever the on-disk
+    mask is known. The default corresponds to roughly 310 pixels on a standard
+    GONG frame, well below the smallest annotated filaments.
+    """
     fill_hole_area: int = 64
     """Fill interior holes up to this area; larger voids are probably real."""
     merge_gap: float = 18.0
@@ -56,7 +67,11 @@ class InstanceConfig:
     itself, and leave it off for one that can.
     """
     max_roundness_area: int = 900
-    """Only blobs below this area are eligible for rejection as sunspots."""
+    """Only blobs below this area are eligible for rejection as sunspots.
+
+    Like ``min_area`` this is a pixel count, so raise it in proportion to the
+    disk if you work at a resolution other than the GONG standard.
+    """
     min_axis_ratio: float = 1.7
     """Minimum major/minor axis ratio for a small blob to be kept."""
     closing_radius: int = 0
@@ -345,8 +360,14 @@ def extract_instances(
     """
     config = config or InstanceConfig()
     mask = np.asarray(probability) >= config.threshold
+
+    min_area = config.min_area
     if valid is not None:
-        mask = mask & np.asarray(valid, dtype=bool)
+        valid = np.asarray(valid, dtype=bool)
+        mask = mask & valid
+        # Scale the size floor with the disk, so the same settings work at any
+        # resolution the data happens to be distributed at.
+        min_area = max(min_area, int(round(config.min_area_fraction * valid.sum())))
     if not mask.any():
         return np.zeros(mask.shape, dtype=np.int32)
 
@@ -356,7 +377,7 @@ def extract_instances(
 
     # 8-connectivity, so diagonally touching barb pixels stay with their filament.
     labels, _ = ndi.label(mask, structure=np.ones((3, 3), dtype=int))
-    labels = remove_small(labels, config.min_area)
+    labels = remove_small(labels, min_area)
     if labels.max() == 0:
         return labels.astype(np.int32)
 

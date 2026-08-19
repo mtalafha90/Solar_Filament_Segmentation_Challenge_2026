@@ -343,14 +343,16 @@ def test_stale_cache_is_ignored_not_misread(synthetic_dataset, tmp_path):
         cache_dir=tmp_path / "cache",
     )
     prepared = dataset[0]
-    cache_file = next((tmp_path / "cache").glob("*.npz"))
 
     # A cache from an older layout, and a truncated one, must both be discarded
-    # and recomputed rather than raising.
-    np.savez_compressed(cache_file, version=np.array(0), junk=np.zeros(3))
-    assert np.array_equal(dataset[0].mask, prepared.mask)
+    # and recomputed rather than raising. Both halves of the split cache are
+    # exercised: photometry lives under frames/, annotations under targets/.
+    for part in ("targets", "frames"):
+        cache_file = next((tmp_path / "cache" / part).glob("*.npz"))
+        np.savez_compressed(cache_file, version=np.array(0), junk=np.zeros(3))
+        assert np.array_equal(dataset[0].mask, prepared.mask)
 
-    dataset[0]  # rewrites a good cache
-    cache_file = next((tmp_path / "cache").glob("*.npz"))
-    cache_file.write_bytes(cache_file.read_bytes()[:64])
-    assert np.array_equal(dataset[0].mask, prepared.mask)
+        dataset[0]  # rewrites a good cache
+        cache_file = next((tmp_path / "cache" / part).glob("*.npz"))
+        cache_file.write_bytes(cache_file.read_bytes()[:64])
+        assert np.array_equal(dataset[0].mask, prepared.mask)

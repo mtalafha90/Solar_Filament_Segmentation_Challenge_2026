@@ -145,10 +145,11 @@ detector, which needs no weights and runs in a couple of seconds per frame.
 Two practical notes:
 
 - The first epoch is slow because every frame is preprocessed; results are
-  cached to `--cache-dir` and later epochs read them straight back. The cache
-  costs about 4 MB per training image — roughly 3 GB for MAGFiLO — because it
-  stores only what is expensive to recompute, at the smallest precision that
-  does not lose information.
+  cached to `--cache-dir` and later epochs read them straight back. It stores
+  only what is expensive to recompute, at the smallest precision that does not
+  lose information, and splits into photometry per *frame* and targets per
+  *annotator record* — so the 447 repeated frames in MAGFiLO are preprocessed
+  once, not twice. That is about 2.8 GB for the training split.
 - Component-size limits scale with the solar disk, so the same settings work
   whether the frames are 512 or 2048 pixels across.
 - Chirality is read from MAGFiLO's `Left` / `Right` categories, not from a
@@ -445,7 +446,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-175 tests cover geometry, photometry, annotation parsing and encoding, the loss
+177 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

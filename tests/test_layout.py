@@ -97,10 +97,12 @@ def test_string_ids_survive_the_dataset_and_its_cache(magfilo_style, tmp_path):
     assert warm.image_id == cold.image_id
     assert np.array_equal(warm.mask, cold.mask)
 
-    # Cache filenames must be safe, and one per observation.
-    written = list((tmp_path / "cache").glob("*.npz"))
-    assert len(written) == 1
-    assert "/" not in written[0].name
+    # Cache filenames must be safe: one photometry file per frame, one target
+    # file per annotator record.
+    frames = list((tmp_path / "cache" / "frames").glob("*.npz"))
+    targets = list((tmp_path / "cache" / "targets").glob("*.npz"))
+    assert len(frames) == 1 and len(targets) == 1
+    assert all("/" not in p.name for p in frames + targets)
 
 
 def test_cache_paths_do_not_collide_for_similar_ids(tmp_path):
@@ -651,3 +653,48 @@ def test_split_without_groups_is_unchanged():
     train_idx, val_idx = split_ids(20, 0.15, seed=0)
     assert len(train_idx) + len(val_idx) == 20
     assert not set(train_idx) & set(val_idx)
+
+
+def test_photometry_is_computed_once_per_frame(tmp_path):
+    """Several annotators share one image, so its preprocessing is shared too."""
+    annotations, train = _two_annotator_dataset(tmp_path)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset = MagfiloDataset(annotations, train, cache_dir=tmp_path / "cache")
+
+    first = dataset[0]
+    second = dataset[1]
+
+    # One photometry file for the frame, one target file per annotator record.
+    frames = list((tmp_path / "cache" / "frames").glob("*.npz"))
+    targets = list((tmp_path / "cache" / "targets").glob("*.npz"))
+    assert len(frames) == 1
+    assert len(targets) == 2
+
+    # The shared parts must be identical, the annotated parts independent.
+    assert np.array_equal(first.image, second.image)
+    assert np.array_equal(first.valid, second.valid)
+    assert first.disk.radius == pytest.approx(second.disk.radius)
+    assert first.image_id != second.image_id
+
+    # And the targets must survive a reload unchanged.
+    reloaded = dataset[0]
+    assert np.array_equal(reloaded.instances, first.instances)
+    assert np.allclose(reloaded.image, first.image, atol=1e-3)
+
+
+def test_frame_cache_is_rebuilt_when_missing(tmp_path):
+    """Deleting the photometry must not corrupt the annotations that reference it."""
+    annotations, train = _two_annotator_dataset(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset = MagfiloDataset(annotations, train, cache_dir=tmp_path / "cache")
+
+    original = dataset[0]
+    for path in (tmp_path / "cache" / "frames").glob("*.npz"):
+        path.unlink()
+
+    rebuilt = dataset[0]
+    assert np.allclose(rebuilt.image, original.image, atol=1e-3)
+    assert np.array_equal(rebuilt.instances, original.instances)

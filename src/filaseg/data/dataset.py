@@ -46,7 +46,7 @@ from .targets import boundary_map, distance_weight, spine_heatmap
 
 # Bumped whenever the cache layout changes, so stale files are simply ignored
 # rather than loaded and misinterpreted.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 # Upper bound used when quantising the per-pixel loss weights into a byte.
 # distance_weight tops out at base + boundary_gain + thin_gain = 6 by default.
@@ -85,7 +85,8 @@ def prepare_observation(
     mask: np.ndarray | None = None,
     instances: np.ndarray | None = None,
     spine_points: Sequence[np.ndarray | None] | None = None,
-    disk_fraction: float = 0.995,
+    disk_fraction: float = 0.96,
+    photometry: tuple[np.ndarray, np.ndarray, SolarDisk] | None = None,
 ) -> PreparedObservation:
     """Preprocess an image and build every supervision target from it.
 
@@ -96,11 +97,17 @@ def prepare_observation(
         instances: Explicit instance label map.
         spine_points: Per-instance spine polylines in ``(y, x)`` order.
         disk_fraction: Fraction of the solar radius treated as valid.
+        photometry: Pre-computed ``(processed, valid, disk)``, to skip the
+            preprocessing step. Several annotators may describe one frame, and
+            the photometry is identical for all of them.
 
     Returns:
         A fully populated :class:`PreparedObservation`.
     """
-    processed, valid, disk = preprocess(image, disk_fraction=disk_fraction)
+    if photometry is not None:
+        processed, valid, disk = photometry
+    else:
+        processed, valid, disk = preprocess(image, disk_fraction=disk_fraction)
     radius_map = disk.radial_map(processed.shape)
     mu = np.sqrt(np.clip(1.0 - np.clip(radius_map, 0.0, 1.0) ** 2, 0.0, 1.0))
     mu = (mu * valid).astype(np.float32)
@@ -304,6 +311,27 @@ class MagfiloDataset:
         """
         return [record.file_name for record in self.records]
 
+    @staticmethod
+    def _safe_name(raw: str) -> str:
+        """A filename-safe form of an arbitrary id, with a hash to avoid clashes."""
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)[:80]
+        return f"{safe}_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+
+    def _frame_cache_path(self, record: ImageRecord) -> Path | None:
+        """Cache for the parts that depend only on the image, not the annotator.
+
+        Preprocessing is by far the slowest step, and in MAGFiLO 447 of the 1154
+        records are second and third annotators' readings of a frame already
+        seen. Keying the photometry on the file rather than the record means it
+        is computed once per image instead of once per record, which is a third
+        off the first epoch and a third off the cache on disk.
+        """
+        if self.cache_dir is None:
+            return None
+        directory = self.cache_dir / "frames"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{self._safe_name(str(record.file_name))}.npz"
+
     def _cache_path(self, record: ImageRecord) -> Path | None:
         """Cache file for one observation.
 
@@ -314,17 +342,21 @@ class MagfiloDataset:
         """
         if self.cache_dir is None:
             return None
-        raw = str(record.image_id)
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)[:80]
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
-        return self.cache_dir / f"{safe}_{digest}.npz"
+        directory = self.cache_dir / "targets"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{self._safe_name(str(record.image_id))}.npz"
 
     def __getitem__(self, index: int) -> PreparedObservation:
         record = self.records[index]
         cache_path = self._cache_path(record)
+        frame_path = self._frame_cache_path(record)
+
+        photometry = None
+        if frame_path is not None and frame_path.exists():
+            photometry = self._load_frame_cache(frame_path)
 
         if cache_path is not None and cache_path.exists():
-            prepared = self._load_cache(cache_path)
+            prepared = self._load_cache(cache_path, photometry)
             if prepared is not None:
                 return prepared
 
@@ -352,8 +384,10 @@ class MagfiloDataset:
                 )
                 self._warned_about_size = True
             rescale_record(record, image.shape[0], image.shape[1])
-        prepared = prepare_observation(image, record=record)
+        prepared = prepare_observation(image, record=record, photometry=photometry)
 
+        if frame_path is not None and photometry is None:
+            self._save_frame_cache(frame_path, prepared)
         if cache_path is not None:
             self._save_cache(cache_path, prepared)
         return prepared
@@ -380,12 +414,59 @@ class MagfiloDataset:
     # :func:`~filaseg.data.targets.distance_weight` produces.
     # ------------------------------------------------------------------
 
-    def _save_cache(self, path: Path, prepared: PreparedObservation) -> None:
+    def _save_frame_cache(self, path: Path, prepared: PreparedObservation) -> None:
+        """Store the photometry, which every annotator's record of this frame shares.
+
+        The prepared image is quantised in place to match what is written. The
+        cache stores float16, so without this the first record of a frame would
+        see full-precision photometry and every later one the quantised version,
+        making results depend on whether the cache happened to be warm. The
+        difference is around 1e-4 and harmless in itself; a result that changes
+        with cache state is not.
+        """
+        prepared.image = prepared.image.astype(np.float16).astype(np.float32)
         np.savez_compressed(
             path,
             version=np.array(CACHE_VERSION),
             image=prepared.image.astype(np.float16),
             valid=np.packbits(prepared.valid),
+            shape=np.array(prepared.image.shape, dtype=np.int32),
+            disk=np.array(
+                [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
+                dtype=np.float64,
+            ),
+        )
+
+    def _load_frame_cache(
+        self, path: Path
+    ) -> tuple[np.ndarray, np.ndarray, SolarDisk] | None:
+        """Read cached photometry, or None if it is stale or damaged."""
+        try:
+            with np.load(path) as blob:
+                if int(blob["version"]) != CACHE_VERSION:
+                    return None
+                shape = tuple(int(v) for v in blob["shape"])
+                image = blob["image"].astype(np.float32)
+                valid = (
+                    np.unpackbits(blob["valid"], count=shape[0] * shape[1])
+                    .astype(bool)
+                    .reshape(shape)
+                )
+                disk = SolarDisk(*[float(v) for v in blob["disk"]])
+        except (KeyError, ValueError, OSError, EOFError, zipfile.BadZipFile):
+            return None
+        return image, valid, disk
+
+    def _save_cache(self, path: Path, prepared: PreparedObservation) -> None:
+        """Store only what this annotator's reading contributes.
+
+        The image, validity mask and disk geometry live in the frame cache,
+        shared with every other record of the same observation, so they are not
+        repeated here.
+        """
+        np.savez_compressed(
+            path,
+            version=np.array(CACHE_VERSION),
             instances=prepared.instances.astype(np.uint16),
             spine=(np.clip(prepared.spine, 0.0, 1.0) * 255).astype(np.uint8),
             boundary=np.packbits(prepared.boundary > 0.5),
@@ -393,35 +474,37 @@ class MagfiloDataset:
                 np.clip(prepared.weight / WEIGHT_MAX, 0.0, 1.0) * 255
             ).astype(np.uint8),
             shape=np.array(prepared.image.shape, dtype=np.int32),
-            disk=np.array(
-                [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
-                dtype=np.float64,
-            ),
             image_id=str(prepared.image_id),
             file_name=prepared.file_name,
         )
 
-    def _load_cache(self, path: Path) -> PreparedObservation | None:
-        """Read a cached observation, or return None if it is stale or damaged."""
+    def _load_cache(
+        self, path: Path, photometry: tuple[np.ndarray, np.ndarray, SolarDisk] | None
+    ) -> PreparedObservation | None:
+        """Read a cached observation, or return None if it cannot be used.
+
+        Needs the frame cache too, since the photometry lives there. Any missing
+        or damaged piece simply means recomputing, which is always safe.
+        """
+        if photometry is None:
+            return None
+        image, valid, disk = photometry
         try:
             with np.load(path) as blob:
                 if int(blob["version"]) != CACHE_VERSION:
                     return None
                 shape = tuple(int(v) for v in blob["shape"])
-                image = blob["image"].astype(np.float32)
-                valid = np.unpackbits(blob["valid"], count=shape[0] * shape[1]).astype(
-                    bool
-                ).reshape(shape)
+                if shape != image.shape:
+                    return None
+                count = shape[0] * shape[1]
                 instances = blob["instances"].astype(np.int32)
                 spine = blob["spine"].astype(np.float32) / 255.0
-                count = shape[0] * shape[1]
                 boundary = (
                     np.unpackbits(blob["boundary"], count=count)
                     .astype(np.float32)
                     .reshape(shape)
                 )
                 weight = blob["weight"].astype(np.float32) / 255.0 * WEIGHT_MAX
-                disk = SolarDisk(*[float(v) for v in blob["disk"]])
                 image_id = normalise_id(blob["image_id"].item())
                 file_name = str(blob["file_name"])
         except (KeyError, ValueError, OSError, EOFError, zipfile.BadZipFile):
@@ -431,14 +514,13 @@ class MagfiloDataset:
             # cache stop training.
             return None
 
-        mask = instances > 0
         radius_map = disk.radial_map(shape)
         mu = np.sqrt(np.clip(1.0 - np.clip(radius_map, 0.0, 1.0) ** 2, 0.0, 1.0))
         return PreparedObservation(
             image=image,
             valid=valid,
             mu=(mu * valid).astype(np.float32),
-            mask=mask,
+            mask=instances > 0,
             instances=instances,
             spine=spine,
             boundary=boundary,

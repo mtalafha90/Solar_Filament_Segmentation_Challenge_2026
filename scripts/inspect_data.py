@@ -203,6 +203,8 @@ def main() -> None:
 
     n_observations = len(dataset)
     print(f"  usable observations     {n_observations}")
+    print(f"  measured on             {min(n_observations, max(1, args.sample))} "
+          f"sampled observation(s)")
     if n_observations == 0:
         raise SystemExit(
             "\nNo observation could be loaded. Check that --image-dir points at "
@@ -213,7 +215,9 @@ def main() -> None:
         prepared = dataset[index]
         coverage.append(float(prepared.mask.sum() / max(prepared.valid.sum(), 1)))
         radii.append(prepared.disk.radius)
-        counts.append(int(prepared.instances.max()))
+        # Count distinct labels, not the largest: clipping to the disk can
+        # remove an instance entirely and leave a gap in the numbering.
+        counts.append(int(np.count_nonzero(np.unique(prepared.instances))))
 
     report: dict = {
         "n_records": len(records),

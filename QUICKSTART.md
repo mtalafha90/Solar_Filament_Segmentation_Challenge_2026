@@ -135,10 +135,9 @@ python scripts/train.py --config configs/default.yaml --data-dir data \
 Notes:
 
 - The **first epoch is slow** — every frame is preprocessed and cached to
-  `data/cache`. Later epochs read the cache and are much faster. Budget roughly
-  **4 MB of disk per training image** (about 3 GB for MAGFiLO's 707 frames), and
-  a few seconds per frame for that first pass. Drop `--cache-dir` if you would
-  rather trade the disk for slower epochs.
+  `data/cache`. Later epochs read the cache and are much faster. Budget about
+  **2.8 GB** for MAGFiLO and roughly an hour for that first pass. Drop
+  `--cache-dir` if you would rather trade the disk for slower epochs.
 - Add `--device cpu` if you have no GPU. Expect it to be slow; drop
   `--patch-size` to 128 and `--samples-per-epoch` to a few hundred to test the
   loop before committing to a full run.

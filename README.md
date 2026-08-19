@@ -135,9 +135,12 @@ Two practical notes:
   whether the frames are 512 or 2048 pixels across.
 - Chirality is read from MAGFiLO's `Left` / `Right` categories, not from a
   field of its own.
-- Records whose image is not in the split are skipped with a count, and two
-  records resolving to the same file is refused outright rather than silently
-  pairing masks with the wrong frames.
+- Frames may sit directly in the split directory or nested inside it; both are
+  found, matching stems exactly so a record whose image was never distributed
+  comes back missing rather than latching on to a similar name.
+- Records whose image is not in the split are skipped with a count, and several
+  records describing the *same* frame are merged, since keeping them apart would
+  present one record's filaments as background in another's.
 - Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
   observations by the original GONG frame name (`040301-20140609195854Bh`)
   rather than an integer, and submissions carry those names back unchanged.
@@ -383,7 +386,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-143 tests cover geometry, photometry, annotation parsing and encoding, the loss
+149 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

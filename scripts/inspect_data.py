@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -25,11 +26,10 @@ import _bootstrap  # noqa: F401
 
 import numpy as np
 
-from filaseg.data.coco import CHIRALITY_NAMES, load_coco, rescale_record, summarise
-from filaseg.data.io import find_image, read_image, resolve_images
-from filaseg.data.layout import DATA_SUFFIXES as SUFFIXES
+from filaseg.data.coco import load_coco, summarise
+from filaseg.data.dataset import MagfiloDataset
+from filaseg.data.io import read_image, resolve_images
 from filaseg.data.layout import count_images, discover, resolve_annotations
-from filaseg.preprocessing.photometry import preprocess
 
 
 def find_layout(data_dir: Path) -> tuple[Path | None, Path | None, Path | None]:
@@ -99,18 +99,38 @@ def main() -> None:
         image_dir, [record.file_name for record in records]
     )
 
-    print(f"  annotation records          {len(records)}")
-    print(f"  image files in {str(image_dir)[-28:]:<28} {len(train_images)}")
-    print(f"  records resolved to an image {len(resolved)}")
-    print(f"  records with no image        {len(missing)}")
+    distinct_names = {record.file_name for record in records}
+    print(f"  annotation records           {len(records)}")
+    print(f"  distinct file names in them  {len(distinct_names)}")
+    print(f"  image files on disk          {len(train_images)}")
+    print(f"  file names resolved          {len(resolved)}")
+    print(f"  file names with no image     {len(missing)}")
     for name in missing[:3]:
         print(f"    - {name}")
     if len(missing) > 3:
         print(f"    ... and {len(missing) - 3} more")
 
-    if missing:
-        print("\n  This is normal: the annotation file covers more observations")
-        print("  than this split contains. Those records are skipped on load.")
+    if len(records) > len(distinct_names):
+        print(f"\n  {len(records) - len(distinct_names)} record(s) repeat a frame "
+              f"already listed. Their filaments are")
+        print("  merged on load, so no filament is presented as background.")
+
+    if missing and resolved:
+        print("\n  Records with no image are normal: the annotation file covers")
+        print("  more observations than this split contains. They are skipped.")
+
+    # If almost nothing resolved, the names on disk differ from the names in the
+    # annotations. Show both, so the mismatch is obvious rather than a mystery.
+    if distinct_names and len(resolved) < 0.5 * len(distinct_names):
+        print("\n  MOST FILE NAMES DID NOT RESOLVE. Compare them:")
+        print("    annotations say : "
+              + ", ".join(sorted(distinct_names)[:3]))
+        print("    on disk         : "
+              + ", ".join(p.name for p in train_images[:3]))
+        directories = sorted({p.parent for p in train_images})[:3]
+        print("    images found in : "
+              + ", ".join(str(d) for d in directories))
+        print("  Point --image-dir at the directory holding the images.")
 
     if collisions:
         print(f"\n  ERROR: {len(collisions)} image file(s) are claimed by more than")
@@ -124,12 +144,14 @@ def main() -> None:
     shapes: Counter = Counter()
     unreadable: list[str] = []
     sampled = 0
+    seen_paths: set[Path] = set()
     for record in records:
         if sampled >= args.sample:
             break
         path = resolved.get(record.file_name)
-        if path is None:
+        if path is None or path in seen_paths:
             continue
+        seen_paths.add(path)
         sampled += 1
         try:
             image = read_image(path)
@@ -157,31 +179,42 @@ def main() -> None:
     else:
         print("  annotation and image sizes agree")
 
-    # Preprocess a sample to measure the statistics that drive configuration.
+    # Measure through the dataset itself, so the numbers describe exactly what
+    # training will see: duplicate frames merged, records without images
+    # dropped, annotations clipped to the disk.
     print("\n" + "=" * 66)
-    print("MEASUREMENTS (from a sample of observations)")
+    print("MEASUREMENTS (as the training pipeline will see them)")
     print("=" * 66)
+
     coverage: list[float] = []
     radii: list[float] = []
     counts: list[int] = []
-    usable = [r for r in records if r.file_name in resolved]
-    sample = usable[: max(1, args.sample)]
+    n_observations = 0
 
-    for record in sample:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         try:
-            image = read_image(resolved[record.file_name])
-        except (FileNotFoundError, ValueError):
-            continue
-        if (record.height, record.width) != image.shape:
-            rescale_record(record, image.shape[0], image.shape[1])
-        _, valid, disk = preprocess(image)
-        mask = record.semantic_mask() & valid
-        coverage.append(float(mask.sum() / max(valid.sum(), 1)))
-        radii.append(disk.radius)
-        counts.append(len(record.annotations))
+            dataset = MagfiloDataset(annotations, image_dir)
+        except ValueError as error:
+            raise SystemExit(f"\n{error}") from error
+
+    n_observations = len(dataset)
+    print(f"  usable observations     {n_observations}")
+    if n_observations == 0:
+        raise SystemExit(
+            "\nNo observation could be loaded. Check that --image-dir points at "
+            "the images these annotations describe."
+        )
+
+    for index in range(min(n_observations, max(1, args.sample))):
+        prepared = dataset[index]
+        coverage.append(float(prepared.mask.sum() / max(prepared.valid.sum(), 1)))
+        radii.append(prepared.disk.radius)
+        counts.append(int(prepared.instances.max()))
 
     report: dict = {
         "n_records": len(records),
+        "n_distinct_file_names": len(distinct_names),
         "n_records_resolved": len(resolved),
         "n_records_without_image": len(missing),
         "n_collisions": len(collisions),

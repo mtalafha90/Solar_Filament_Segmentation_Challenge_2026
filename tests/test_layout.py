@@ -205,14 +205,27 @@ def test_find_image_matches_exactly_and_by_stem(tmp_path):
     assert find_image(tmp_path, "train/a.jpeg").name == "a.jpeg"  # prefix dropped
 
 
-def test_find_image_does_not_search_below_by_default(tmp_path):
-    """A loose search can silently pair a mask with the wrong frame."""
+def test_find_image_searches_below_but_matches_exactly(tmp_path):
+    """Releases nest frames one level down, so subdirectories are searched.
+
+    The safety property is not that we refuse to look, but that we match the
+    stem *exactly*: a record whose image was never distributed must come back
+    missing rather than latching on to a similarly named frame. Pairing a mask
+    with the wrong image is far worse than a missing file.
+    """
     from filaseg.data.io import find_image
 
     _touch(tmp_path / "sub" / "b.jpeg")
+    assert find_image(tmp_path, "b.jpeg").name == "b.jpeg"
+
+    # A near-miss must not match, at any depth.
+    for name in ("b_extra.jpeg", "bb.jpeg", "b2.jpeg"):
+        with pytest.raises(FileNotFoundError):
+            find_image(tmp_path, name)
+
+    # And opting out of the search still works.
     with pytest.raises(FileNotFoundError):
-        find_image(tmp_path, "b.jpeg")
-    assert find_image(tmp_path, "b.jpeg", search_subdirectories=True).name == "b.jpeg"
+        find_image(tmp_path, "b.jpeg", search_subdirectories=False)
 
 
 def test_find_image_raises_for_a_genuinely_absent_file(tmp_path):
@@ -367,3 +380,125 @@ def test_min_area_scales_with_the_solar_disk():
         probability, valid, InstanceConfig(min_area_fraction=0.0)
     )
     assert unscaled.max() == 2             # 48 px survives a flat floor of 40
+
+
+# ---------------------------------------------------------------------------
+# Nested image directories and repeated frames, both as MAGFiLO ships them
+# ---------------------------------------------------------------------------
+
+
+def _write_frame(path: Path, size: int = 64) -> None:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(
+        np.random.default_rng(0).integers(0, 255, (size, size), dtype=np.uint8)
+    ).save(path, quality=95)
+
+
+def test_resolve_images_finds_frames_nested_one_level_down(tmp_path):
+    """Releases often put the frames in an images/ folder inside the split."""
+    from filaseg.data.io import resolve_images
+
+    train = tmp_path / "train"
+    _write_frame(train / "images" / "20140609195854Bh.jpeg")
+
+    resolved, missing, collisions = resolve_images(
+        train, ["20140609195854Bh.jpeg", "20990101000000Bh.jpeg"]
+    )
+    assert not collisions
+    assert missing == ["20990101000000Bh.jpeg"]
+    assert resolved["20140609195854Bh.jpeg"].parent.name == "images"
+
+
+def test_repeated_file_name_resolves_once_without_a_collision(tmp_path):
+    from filaseg.data.io import resolve_images
+
+    train = tmp_path / "train"
+    _write_frame(train / "images" / "a.jpeg")
+    resolved, missing, collisions = resolve_images(train, ["a.jpeg", "a.jpeg"])
+    assert not collisions and not missing
+    assert len(resolved) == 1
+
+
+def test_build_image_index_maps_stems_to_files(tmp_path):
+    from filaseg.data.io import build_image_index
+
+    _write_frame(tmp_path / "a.jpeg")
+    _write_frame(tmp_path / "deep" / "b.jpeg")
+    index = build_image_index(tmp_path)
+    assert set(index) == {"a", "b"}
+    assert index["b"][0].name == "b.jpeg"
+
+
+def _duplicate_frame_dataset(tmp_path):
+    """One frame described by two records, each holding half its filaments."""
+    train = tmp_path / "train"
+    _write_frame(train / "images" / "frameA.jpeg", size=96)
+    coco = {
+        "info": {}, "licenses": [],
+        "categories": [{"id": 1, "name": "Left"}, {"id": 2, "name": "Right"}],
+        "images": [
+            {"id": "r1", "file_name": "frameA.jpeg", "height": 96, "width": 96},
+            {"id": "r2", "file_name": "frameA.jpeg", "height": 96, "width": 96},
+            {"id": "held", "file_name": "not_shipped.jpeg", "height": 96, "width": 96},
+        ],
+        "annotations": [
+            {"id": 1, "image_id": "r1", "category_id": 1, "bbox": [30, 30, 20, 20],
+             "segmentation": [[30, 30, 50, 30, 50, 50, 30, 50]], "area": 400},
+            {"id": 2, "image_id": "r2", "category_id": 2, "bbox": [55, 30, 20, 20],
+             "segmentation": [[55, 30, 75, 30, 75, 50, 55, 50]], "area": 400},
+            {"id": 3, "image_id": "held", "category_id": 1, "bbox": [1, 1, 5, 5],
+             "segmentation": [[1, 1, 6, 1, 6, 6]], "area": 12},
+        ],
+    }
+    path = train / "MAGFiLO_ann.json"
+    path.write_text(json.dumps(coco))
+    return path, train
+
+
+def test_records_describing_one_frame_are_merged(tmp_path):
+    """Kept apart, each record would present the other's filaments as background."""
+    annotations, train = _duplicate_frame_dataset(tmp_path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dataset = MagfiloDataset(annotations, train)
+
+    assert len(dataset) == 1
+    assert len(dataset.records[0].annotations) == 2   # both halves kept
+    assert dataset.merged == 1
+    assert dataset.missing == ["not_shipped.jpeg"]
+
+    messages = " ".join(str(w.message) for w in caught)
+    assert "merged" in messages
+    assert "have no image" in messages
+
+    # Both filaments must survive into the supervision targets.
+    prepared = dataset[0]
+    assert prepared.instances.max() == 2
+
+
+def test_merged_records_keep_their_chirality(tmp_path):
+    annotations, train = _duplicate_frame_dataset(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset = MagfiloDataset(annotations, train)
+    chirality = sorted(a.chirality for a in dataset.records[0].annotations)
+    assert chirality == [1, 2]
+
+
+def test_dataset_reports_zero_observations_rather_than_guessing(tmp_path):
+    """If nothing resolves, say so; do not silently train on an empty set."""
+    train = tmp_path / "train"
+    train.mkdir()
+    coco = {
+        "info": {}, "licenses": [], "categories": [{"id": 1, "name": "Left"}],
+        "images": [{"id": "x", "file_name": "x.jpeg", "height": 32, "width": 32}],
+        "annotations": [],
+    }
+    path = train / "ann.json"
+    path.write_text(json.dumps(coco))
+    with pytest.warns(UserWarning, match="have no image"):
+        dataset = MagfiloDataset(path, train)
+    assert len(dataset) == 0

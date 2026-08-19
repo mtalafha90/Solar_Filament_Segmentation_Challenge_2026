@@ -162,7 +162,7 @@ class MagfiloDataset:
         cache_dir: str | Path | None = None,
         image_ids: Sequence[ImageId] | None = None,
         require_images: bool = True,
-        search_subdirectories: bool = False,
+        search_subdirectories: bool = True,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.search_subdirectories = bool(search_subdirectories)
@@ -184,6 +184,7 @@ class MagfiloDataset:
         # frame and nothing downstream could tell.
         self.resolved: dict[str, Path] = {}
         self.missing: list[str] = []
+        self.merged: int = 0
         if require_images:
             self.resolved, self.missing, collisions = resolve_images(
                 self.image_dir,
@@ -197,11 +198,9 @@ class MagfiloDataset:
                 )
                 raise ValueError(
                     f"{len(collisions)} image file(s) are referenced by more than one "
-                    f"annotation record. Loading these would pair masks with the "
-                    f"wrong frames, so this is refused rather than warned about."
-                    f"\n  {examples}\n"
-                    f"The annotation file most likely covers several splits whose "
-                    f"file names collide once the directory prefix is dropped. "
+                    f"annotation record under different names. Loading these would "
+                    f"pair masks with the wrong frames, so this is refused rather "
+                    f"than warned about.\n  {examples}\n"
                     f"Point --image-dir at the directory the names refer to, or "
                     f"filter the annotation file to one split."
                 )
@@ -217,7 +216,41 @@ class MagfiloDataset:
                 )
                 records = [r for r in records if r.file_name in self.resolved]
 
+            records = self._merge_duplicate_frames(records)
+
         self.records = records
+
+    def _merge_duplicate_frames(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """Fold records that describe the same frame into one.
+
+        MAGFiLO lists some observations more than once, each entry carrying part
+        of that frame's filaments. Kept apart, every entry would present the
+        other entries' filaments as background, teaching the model that real
+        filaments are quiet Sun. Their annotations are therefore combined.
+        """
+        by_file: OrderedDict[str, ImageRecord] = OrderedDict()
+        duplicates = 0
+        for record in records:
+            existing = by_file.get(record.file_name)
+            if existing is None:
+                by_file[record.file_name] = record
+                continue
+            existing.annotations.extend(record.annotations)
+            existing.height = existing.height or record.height
+            existing.width = existing.width or record.width
+            duplicates += 1
+
+        self.merged = duplicates
+        if duplicates:
+            warnings.warn(
+                f"{duplicates} annotation record(s) described a frame already "
+                f"listed; their filaments were merged into it, leaving "
+                f"{len(by_file)} distinct observations. Keeping them separate "
+                f"would have shown the model real filaments labelled as "
+                f"background.",
+                stacklevel=3,
+            )
+        return list(by_file.values())
 
     def __len__(self) -> int:
         return len(self.records)

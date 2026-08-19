@@ -197,6 +197,15 @@ the error lists them so you can pick.
 expected. MAGFiLO's annotation file covers more observations than any one split
 ships. `inspect_data.py` shows the counts.
 
+**`N annotation record(s) described a frame already listed`** — also expected.
+MAGFiLO lists some frames more than once, each entry holding part of that
+frame's filaments. They are merged, because keeping them apart would show the
+model real filaments labelled as background.
+
+**`MOST FILE NAMES DID NOT RESOLVE`** — `inspect_data.py` prints the names the
+annotations use beside the names on disk and the directory the images were found
+in. Point `--image-dir` at that directory.
+
 **`image file(s) are referenced by more than one annotation record`** — two
 records would be paired with the same frame, so loading is refused rather than
 silently training on wrong masks. Point `--image-dir` at the split the names

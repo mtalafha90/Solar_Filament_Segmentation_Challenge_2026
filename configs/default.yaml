@@ -1,0 +1,62 @@
+# Default training configuration for FilaNet on MAGFiLO.
+#
+# Override any value on the command line, for example:
+#   python scripts/train.py --config configs/default.yaml --epochs 80
+#
+# Paths are left blank on purpose: point them at your copy of the data.
+
+annotations: ""            # path to the MAGFiLO COCO JSON
+image_dir: ""              # directory holding the GONG observations
+cache_dir: "data/cache"    # preprocessed frames are cached here after epoch 1
+output_dir: "runs/filanet"
+
+# Data split
+val_fraction: 0.15
+seed: 0
+
+# Patch sampling.
+# Filaments cover well under one per cent of the disk, so most crops are centred
+# on an annotated filament. The remaining 30% are drawn uniformly and are what
+# teach the model to reject sunspots and plage.
+patch_size: 256
+batch_size: 8
+samples_per_epoch: 2000
+positive_fraction: 0.7
+num_workers: 4
+
+# Optimisation
+epochs: 60
+learning_rate: 0.0003
+weight_decay: 0.0001
+warmup_epochs: 2
+grad_clip: 1.0
+amp: true
+
+# Weight on the positive class inside the cross-entropy term. Raise it if the
+# model under-segments, lower it if it floods the disk.
+pos_weight: 4.0
+
+# Validation runs on whole disks, and the best threshold is stored alongside the
+# checkpoint so that prediction needs no manual calibration.
+val_every: 1
+val_tile: 512
+
+model:
+  in_channels: 2           # flattened intensity + heliocentric-angle geometry
+  base_width: 32
+  depth: 4                 # four downsamplings; deeper loses barbs
+  edge_channels: 32
+  n_heads: 8
+  dropout: 0.0
+  deep_supervision: true
+  aux_heads: true
+  edge_attention: true
+
+loss:
+  bce: 1.0
+  tversky: 1.0
+  cl_dice: 1.0             # the topology term that keeps barbs alive
+  focal: 0.5
+  spine: 0.5
+  boundary: 0.5
+  deep: 0.4

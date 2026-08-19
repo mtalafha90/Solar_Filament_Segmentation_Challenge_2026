@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data and run artefacts are large and should not be committed.
+# These are anchored with a leading slash so they match only at the repository
+# root: an unanchored "data/" would also match src/filaseg/data/ and silently
+# drop a whole module from the repository.
+/data/
+/runs/
+*.pt
+*.npz
+submission.json
+submission.csv
+
+# LaTeX build products
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.synctex.gz
+*.fdb_latexmk
+*.fls

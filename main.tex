@@ -1,217 +1,413 @@
 \documentclass[11pt]{article}
 \usepackage{colacl}
 \usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
 \usepackage[font=small,skip=10pt]{caption}
 \usepackage{titlesec}
 \setcounter{secnumdepth}{4}
 \sloppy
 
+\title{Barb-Aware Segmentation of Solar Filaments in Full-Disk H-alpha Observations}
 
-
-\title{Detecting Insults in Social Commentary}
-\author
-{Prashant Ravi \\ Department of Computer Science \\ University of Illinois at Urbana Champaign \\ email:ravi7[at]illinois[dot]edu}
-
-
-
+\author{Solar Filament Segmentation Challenge 2026 \\ IEEE Big Data Cup submission}
 
 \begin{document}
 \maketitle
 
-
 \begin{abstract}
-This report gives an overview of the various machine learning algorithms implemented to detect certain comments that may appear insulting to another participant on a social networking platform. Feature selection was performed using n-grams, and the WEKA machine learning toolkit was used to build supervised learning clasifiers, that provided an accuracy of 82\% on the test dataset. The dataset was obtained from the popular data science competition portal, Kaggle. 
+Solar filaments are cool, dense ribbons of plasma suspended in the corona.
+They matter for space weather because their eruption drives coronal mass
+ejections, and their fine side-threads, called barbs, encode the chirality of
+the magnetic field that supports them. Segmenting filaments is therefore not a
+matter of finding dark pixels: the thin structures that carry the science are a
+small fraction of the area, and they are exactly what a conventionally trained
+network discards. We describe a complete segmentation system built around that
+observation. Physically motivated preprocessing removes limb darkening and
+atmospheric gradients so that filament contrast becomes uniform across the
+disk. A multi-task U-Net, whose bottleneck attention is steered by a learnable
+edge map, predicts the filament mask alongside its centreline and boundary.
+The training objective combines a centreline Dice term with a recall-weighted
+Tversky loss, which together penalise the deletion of a barb far more heavily
+than its small pixel count would suggest. A geometric post-processing stage
+rejoins fragmented filaments into single objects and rejects sunspots by shape.
+We also provide a competitive training-free detector based on multi-scale ridge
+filtering and hysteresis thresholding. All components are validated end to end
+on synthetic observations that reproduce the relevant properties of GONG data,
+and an ablation shows what each contributes.
 \end{abstract}
 
 \section{Introduction}
-Machine learning is an important field today with mass availability of internet access, and with it the amount of context-specific data that could be analysed to optimize daily pracitices. Be it Netflix's movie recommendation system or Facebook's face recognition software, the common underlying magic owes it to machine learning algorithms. A big motivation for this, is that humans are great at finding patterns in data sets, and its true that if we had enough humans to find these complex patterns, they may actually perform better than computers, but with the amount of data that has amassed due to the 'Internet of things' its practically impossible to have a human eye to go over such large data sets. Enter, machine learning, which for this very reason has become an indispensable tool for the analysis of data. While, the internet of things has completely revolutionized the communication industry, sometimes, users of these websites break the terms and conditions of the host website that strictly prevent the usage of abusive language.  In this project we will apply and analyse some machine learning algorithms that are bundled in WEKA (Waikato Environment for Knowledge Analysis), to a data set to predict if a comment would be considered insulting or not, to a peer on a social networking platform.    
 
-\section{Methodology}
-The basic methodology can be described by the following figure, which will be further elaborated on, in the following subsections.
+A solar filament is a ribbon of relatively cool, dense plasma held above the
+solar surface by the magnetic field. Seen against the bright disk in the
+H-alpha line it appears as a dark, elongated, often strongly curved thread.
+Filaments matter operationally because their eruption is a principal driver of
+coronal mass ejections, which in turn disturb power grids, satellite
+navigation, aviation and spacecraft operations \cite{mackay2010}. They also
+matter scientifically: the short side-threads that leave a filament's spine at
+a steep angle, known as barbs, indicate the chirality of the supporting
+magnetic field. Despite this, no operational system currently provides
+continuous automated filament detection.
 
-\begin{figure}[h]
-\includegraphics[width=4.5cm,height=4.5cm,scale=0.2]{Method.jpg}
-\end{figure}
+The release of MAGFiLO \cite{magfilo2024} changes what is possible. It provides
+10,244 manually annotated filaments across 1,593 full-disk H-alpha observations
+from the Global Oscillation Network Group \cite{gong1996}, each with a polygon
+mask, a bounding box, a spine and a chirality label, produced over roughly one
+thousand person-hours with a double-blind review process.
 
-\subsection{Preprocessing}
-The data was presented in the form of a csv file on the Kaggle data science competition portal and this data had to be preprocessed before any further analysis could be carried out. The preprocessing involved the removal of any non-printable hexadecimal characters, special characters and html tags. The raw data, for example contained text such as "A \textbackslash\textbackslash xc2\textbackslash\textbackslash xa0majority of Canadians can and has been wrong before now and will be again.\textbackslash\textbackslash n Unless you're supportive of the idea" would be converted to "a  majority of canadians can and has been wrong before now and will be again unless youre supportive of the idea." This was performed in order to get a cleaner training data set. Regex, was used to perform the parse and discard of these special characters, and the rest of the text was converted to lowercase for simplicity. The second part of the preprocessing step involved the stemming of tokens, to reduce the words to its roots, however in the final iteration of the code write up, this step was discarded because some of the insults were being wrongly tokenized and a reduction in overall accuracy occured.
+This paper describes a segmentation system designed around three properties of
+the target that ordinary segmentation practice handles badly.
 
+\paragraph{The thin parts carry the information.}
+Barbs are a few pixels across. They contribute little to any area-based
+overlap measure, so a model optimised for Dice can delete every barb at almost
+no cost. This is not a hypothetical failure: it is the default outcome.
 
-\subsection{Feature Extraction}
-The feature extraction step involved the tokenizing of the words to make a "bag of words" that could be later analysed using the WEKA toolkit. For this step, the StringToWordVector WEKA command-line tool was very effective in making a word-vector for the data sets. The word vector was constructed such that words occuring in a sentence were presented in this vector along with its frequency. For this feature-extraction step n-grams, specifically 1,2,3-grams were used to find 1,2 or 3 consecutive words in each sentence of the training set. For example, if the following phrase "a cat walk" is considered, a 2-gram would be "cat walk". While genereating these n-grams it was observed that a lot of common words were occuring in the attribute list that won't add any importance to the feature set due to its common use in sentence structuring. Words such as "the", "is", "and" are examples of 1-grams that should be ignored. In order to carry this out, a stopwords list that is provided by WEKA by default was used to ignore 1-grams that won't add value to the feature set. 
+\paragraph{The target is rare.}
+Filaments cover well under one per cent of the solar disk. Uniform patch
+sampling would spend nearly the entire training budget on empty quiet Sun.
 
-\subsubsection{Final feature set}
+\paragraph{Darkness alone is not diagnostic.}
+Sunspots are darker than most filaments. Any detector keyed on brightness finds
+sunspots first, so they must be separated by shape rather than by contrast.
 
-\paragraph{Word Vectors}
-: Vector for each comment that consists of tokens of words that occur in the comment along with its Term frequency x Inverse document freqeuncy, commonly known as tf-idf score. This score measures fraction of the occurence of an attribute in the given comment over the entire given document. As discussed by \newcite{goyal2014} a keyword's term frequency is the number of times the wor appears in the title. Its document frequency is the number of title the word appears over the total number of titles. The keywords's tf-idf weright is its term frequency divided by its document frequency. 
-\paragraph{Length of string}
-: The length of the comment was included as a numeric attribute
-\paragraph{Number of special characters}
-: The number of special characters such as ">!@<" that were present in the original comment. But these don't inculde commas, semicolons and period signs as these are syntax that are required by every sentence, and hence not a meaningful feature.
-\paragraph{Number of upper case letters }
-: It was observed that comments usually contain expletives that were exclaiming or loudly putting forward the abusive terms in  upper case letters. For example. "you SUCK!!!!" is an easy illustration. In order to retrieve the term "SUCK" all the special characters were replaced with spaces and eventually in order to make tokenizing simpler, the uppercase terms were converted back to lower case.
+\section{Method}
 
-\subsection{Feature Selection}
-Feature selection is performed to automatically search for the subset of the attributes in the dataset to find the one with with the highest accuracy. We looked at how we were able to condense the feature set of several words in comments and their upto 3-grams but for such a large data set how did we come up with the ~1000 "top" features, ranked per-class basis. A feature slection algorithm was in effect that by the statistical tool, "Chi-Squared Test" was able to find the best 1000 features from the set of nearly 5000 features that we obtained from the training data set. 
+\subsection{Photometric preprocessing}
 
-\paragraph{Chi-Squared Test}
-:The chi-squared test is in effect to reduce the number of attributes that we have in our feature set of word vectors.It does so by testing the independence of two events. To be more specific of its functionality and its relation to our problem, it tests the dependence of the occurnce of the given attribute to the occurence of the class {isGood, isBad} that we have set up to distinguish between an insult or not. 
+Two effects dominate a raw frame before any filament signal is visible. Limb
+darkening makes the disk centre tens of per cent brighter than the edge, so a
+filament near the limb is darker in absolute terms than quiet Sun at disk
+centre. Ground-based observation adds smooth transmission gradients from thin
+cloud, haze and imperfect flat fields, which differ between the six GONG sites
+and between successive frames from one site.
 
-\begin{figure}[h]
-\includegraphics[width=8.0cm,height=1.30cm,scale=1.0]{cht2.png}
-\end{figure}
+We locate the limb by marching outwards along 360 rays and taking the point of
+steepest intensity fall-off, refined to sub-pixel accuracy by fitting a
+parabola to the gradient peak, then fitting a circle to the crossings with one
+round of outlier rejection. The steepest-gradient criterion is preferred to a
+fixed half-intensity crossing because limb darkening already dims the disk
+substantially before the true edge, which biases any level-crossing inwards.
+On synthetic frames this recovers the radius to $0.07\%$ and the centre to
+$0.01$ pixels.
 
+We then measure the radial intensity profile as a \emph{median} within radial
+bins and divide it out. The median is what makes the estimate robust:
+filaments and sunspots are a small minority of pixels in any bin, so they
+barely move it. Any remaining large-scale gradient is estimated by normalised
+convolution at a length scale far coarser than a filament width and divided out
+as well, which flattens the haze while leaving the filaments intact.
 
-Then to find the dependence of this variable "fuck" to insult is given by the expection E('fuck', isBad) = $\frac{N('fuck')*N('isBad')}{N}$ where N is the total number of rows, and the numerator is read as the number of rows with attribute "fuck" times the number of attributes that have the class attribute "isBad". And this is true for any n-gram variable too. Then to measure the dependence the formula is given by
+The result is that filament contrast becomes uniform across the disk. Measured
+in three radial bands on synthetic data, the filament-to-quiet-Sun contrast is
+$0.537$, $0.531$ and $0.549$, where the unprocessed image varies by tens of per
+cent. A single threshold now carries the same meaning everywhere on the disk.
 
-$\chi^{2} = \sum_{x} \frac{(Ex(x,y)-E(x,y))^2}{E(x,y)}$
+\subsection{Network}
 
-where Ex(x,y) reads as the experimental observation of the attribute x, and class attribute y as we look through each of the atttributes, the chi-square is summed up and 1000 variables with the highest dependence to the class attribute are selected by this feature selection algorithm. 
-The end goal for such a procedure is to ultimately avoid overfitting, reduce memory consumption , find meaningful attributes that would later aid decision tree based algorithms to find splitting nodes and in general improve the speed of such algorithms due to the size of the feature space.
+FilaNet is a U-Net \cite{unet2015} encoder--decoder with residual,
+group-normalised blocks. Group normalisation is used because large crops force
+small batches, and batch statistics estimated from two or four samples are too
+noisy to help. The encoder performs four downsamplings; going deeper enlarges
+the receptive field but coarsens the grid past the point where barbs survive.
 
-\paragraph{Batch Filtering}
-After realizing the attribute set, a batch filter was run to tokenize the word vectors for both the training set data and the test data. This assures that both data sets contain the same set of attributes that would be evaluated by the different classifiers.
+\paragraph{Edge-guided attention.}
+Self-attention at the bottleneck \cite{attention2017} mixes tokens by feature
+similarity, and a barb's tokens resemble the quiet Sun around them. We
+therefore extract an explicit edge map from the input with a learnable filter
+bank initialised to Sobel, Laplacian and ridge kernels, so it begins as a
+genuine edge detector \cite{canny1986} and refines from there. That map is
+linearly projected and added to the attention Queries and Keys:
+%
+\begin{align}
+Q &= W_q x + W_{q}^{e} E, \\
+K &= W_k x + W_{k}^{e} E, \\
+V &= W_v x,
+\end{align}
+%
+so tokens on a strong edge attend differently from tokens in a smooth region.
+Values are deliberately left untouched: the edge map should determine what
+attends to what, not overwrite the semantic content being aggregated. The two
+edge projections are zero-initialised, so the block starts as ordinary
+self-attention and learns how much edge guidance to admit, which keeps early
+training stable. Because the edge map varies with image content, it also
+supplies the spatial variation that a learned positional encoding would
+otherwise provide. This design follows the direction set by EdgeAttNet
+\cite{edgeattnet2025}, at 9.7M parameters against their 22.7M.
 
-\subsection{Classification}
+\paragraph{Multi-task heads.}
+Alongside the mask, the decoder predicts the filament centreline and its
+boundary. Both are free to ignore at inference, but they force the shared
+decoder to represent the skeleton and outline explicitly. Deep supervision on
+the mask at several decoder scales gives the encoder a shorter gradient path.
 
-Several different classifiers were appplied on the arff files that were generated by carrying out the feature extraction and feature selection phases, but in the following subsection only the classifiers with the highest accuracy will be discussed for the evaluation of performance on test data set. In addition, k-fold cross validation was performed on the training set before evaluating the test data set, and in this project, for all classifiers, the default k is set to 5. The advanatages of performing k-fold cross validation included that it prevents overfitting of the classifier model and provides generality to the model that could later better classify an independent data set, such as the test data set. The size of test data set here is 2649 instances and train data set is 3948 instances.
+\subsection{Training objective}
 
-\subsubsection{Support Vector Machines}
-Support Vector machines function by putting the training data instances in an n-dimensional vector space to find a clear gap or margin between the support vectors that best represent the different classes of the space.Next, the test data instances are also mapped to this vector space and is classified to be an Insult or not Insult based on which side of the gap, the attributes cause the instance to fall .  Refer Table ~\ref{table-4} which contains metrics based on test instance classification and other parameters. The C parameter was chosen to be a low value to avoid overfitting.
+The loss matters more than the architecture. We optimise
+%
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\mathrm{BCE}} + \mathcal{L}_{\mathrm{Tv}}
+  + \mathcal{L}_{\mathrm{clDice}} + \tfrac{1}{2}\mathcal{L}_{\mathrm{focal}}
+  + \mathcal{L}_{\mathrm{aux}} ,
+\end{equation}
+%
+where $\mathcal{L}_{\mathrm{aux}}$ collects the spine, boundary and
+deep-supervision terms.
+
+The decisive term is centreline Dice \cite{cldice2021}, computed on
+differentiable soft skeletons obtained by iterative morphological thinning. It
+scores topology rather than area: deleting a barb breaks a branch of the
+skeleton, which clDice punishes heavily even though the pixel count scarcely
+moves. On a synthetic filament whose barb accounts for $13.5\%$ of its pixels,
+removing that barb raises the clDice loss by a factor of $37$ but the Tversky
+loss \cite{tversky2017} by only $7.7$.
+
+Two supporting choices follow the same logic. Tversky with $\beta > \alpha$
+weights false negatives above false positives, because a missed barb is a hard
+failure against the challenge's fine-structure criterion whereas a few
+over-called boundary pixels are cheap. Per-pixel weights derived from a
+distance transform concentrate the cross-entropy on outlines and on locally
+thin regions, so a two-pixel barb receives the full weighting bonus while the
+body of a filament receives almost none. Focal loss \cite{focal2017}
+down-weights the easy quiet-Sun pixels that otherwise dominate.
+
+The clDice term is ramped in linearly over the first 500 optimisation steps.
+Skeletonising a randomly initialised, nearly uniform prediction is meaningless
+and destabilises early training; the topology term is only switched on once the
+mask term has produced something with a shape.
+
+\subsection{Sampling and inference}
+
+Because filaments are rare, $70\%$ of training crops are centred on an
+annotated filament. The remaining $30\%$ are drawn uniformly from the disk and
+are not optional: they are what teaches the model to reject sunspots and plage.
+
+At inference the frame is processed in overlapping full-resolution tiles,
+blended with a raised-cosine window that falls to near zero at each tile edge,
+so a pixel's prediction is dominated by the tile that saw the most context
+around it. Downsampling the frame to fit the network is never acceptable here,
+since it destroys precisely the structures being scored. Eight-fold dihedral
+test-time augmentation is applied by default.
+
+\subsection{From pixels to filaments}
+
+The challenge asks for each filament as one coherent object, which connected
+components do not deliver. A faint waist or a moment of poor seeing splits one
+filament into two, costing a detection and adding a false positive. We rejoin
+two components when an endpoint of each lies within a set distance \emph{and}
+both spines run along the line joining them. Requiring the directions to agree
+is what prevents two unrelated filaments passing close by from being welded
+together.
+
+Sunspots are then rejected by shape, using second-moment axis ratios, so the
+test depends on geometry rather than on a brightness cutoff and transfers
+across instruments. Only small components are eligible; a large round region is
+more likely to be a genuine filament complex. On synthetic frames with a heavy
+sunspot load this reduces the false discovery rate from $0.60$ to $0.14$.
+
+\subsection{A training-free detector}
+
+We also provide a classical detector requiring no training data, useful both as
+a reference and as a fallback for observations unlike anything in the training
+set. Each pixel is scored by combining a multi-scale Hessian ridge response
+\cite{frangi1998}, which responds to elongated structures and largely ignores
+round ones, with the local intensity deficit. Hysteresis thresholding then
+seeds confident filament cores at a high threshold and grows them through
+anything above a much lower one. This is what recovers barbs: a barb never
+exceeds the high threshold alone, but it is connected to a core that does,
+whereas an isolated noise excursion of the same amplitude is not.
+
+Its single assumption is stated physically rather than hidden in a percentile:
+the fraction of the disk covered by filament cores. This matters, because
+filament coverage varies by an order of magnitude over the solar cycle, and
+seeding $1.2\%$ of the disk when filaments cover $5\%$ caps recall regardless of
+the quality of the score map. We evaluated Otsu's method as an automatic
+alternative and rejected it: it assumes two classes of comparable size, and on
+sparse frames it over-segments badly, estimating $21\%$ coverage for a frame
+whose true coverage was $1.2\%$.
+
+\section{Evaluation}
+
+We report the challenge metrics: pixel IoU, precision, recall, average
+precision at several IoU thresholds, hit and miss rates, pairwise IoU and
+multi-scale IoU (MSIoU) \cite{msiou2021}. We add clDice as a direct read-out of
+whether fine structure survived.
+
+MSIoU exists because plain IoU judges thin structures poorly. It compares
+Sobel edge maps of the two masks over a ladder of grid resolutions: at fine
+grids it behaves like ordinary IoU, while at coarse grids a small offset stops
+mattering and a genuinely absent structure still scores nothing. Table
+\ref{tab:metrics} shows why this matters.
 
 \begin{table}[h]
- \begin{center}
-  %\tabcolsep=0.11cm
-\begin{tabular}{|l|l|}
-
-	\hline
-     Metric & Value  \\
-     \hline\hline
-     Correctly Classified Instances & 81.564\% \\
-	 Cross-Validation Accuracy & 78.2366\%\\
-     C parameter & 4.0 \\
-     Mean Absolute Error& 0.26319 \\
-     
-     \hline
-     
- \end{tabular}
-\caption{Evaluation metrics using Support Vector Machine Classifier}\label{table-4}
- \end{center}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Prediction & IoU & MSIoU & clDice \\
+\midrule
+Exact & 1.000 & 1.000 & 1.000 \\
+Shifted one pixel & 0.628 & 0.749 & 0.994 \\
+Barb deleted & 0.914 & 0.908 & 0.940 \\
+\bottomrule
+\end{tabular}
+\caption{Metric behaviour on a synthetic filament. A one-pixel shift devastates
+IoU while MSIoU and clDice correctly report the structure as right. Deleting a
+barb barely touches IoU, which is why the training objective cannot rely on
+it.}\label{tab:metrics}
+\end{center}
 \end{table}
 
-\subsubsection{Naive Bayes Multinomial}
-Naive Bayes Multinomial was expected to have very good results since its ideal for text classification but it performed poorly. A good reason for this could be that the test data set contained several expletives that were represented alternatively such as "you are a f00l" which by the human eye is read as "you are a fool" but while tokenizing it was not mapped correctly to token with high prior probability of being a negative term.
+\subsection{Synthetic validation}
+
+The competition data must be downloaded separately, so all numbers reported
+here come from a seeded synthetic generator that reproduces the properties
+relevant to algorithm design: a limb-darkened disk, transmission gradients,
+photon and detector noise, dark round sunspots, bright plage, a chromospheric
+network texture, and dark curved filaments carrying barbs. \textbf{These are
+not competition scores}, and the real data is harder in ways synthetic data
+cannot capture, above all the irregularity of genuine sunspot groups and the
+variability of seeing across the six GONG sites. Their purpose is to
+demonstrate that the pipeline is correct end to end and that each component
+earns its place.
+
+\subsection{Detector comparison}
+
+Table \ref{tab:headtohead} compares the two detectors on the same held-out
+observations, with identical ground truth and metric code.
 
 \begin{table}[h]
- \begin{center}
-  %\tabcolsep=0.11cm
-\begin{tabular}{|l|l|}
-
-	\hline
-     Metric & Value  \\
-     \hline\hline
-     Correctly Classified Instances & 75.06\% \\
-     Cross-Validation Accuracy & 74.91\% \\
-	 Mean Absolute Error& 0.1881 \\
-     \hline
-     
- \end{tabular}
-\caption{Evaluation metrics using Naive Bayes Multinomial Classifier}\label{table-3}
- \end{center}
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Metric & Classical & FilaNet \\
+\midrule
+IoU & 0.622 & \textbf{0.878} \\
+Dice & 0.723 & \textbf{0.935} \\
+Precision & \textbf{0.940} & 0.924 \\
+Recall & 0.643 & \textbf{0.946} \\
+clDice & 0.747 & \textbf{0.977} \\
+MSIoU & 0.625 & \textbf{0.863} \\
+Hit rate & 0.583 & \textbf{0.958} \\
+Pairwise IoU & 0.518 & \textbf{0.863} \\
+AP@0.50 & 0.567 & \textbf{0.954} \\
+AP@0.75 & 0.437 & \textbf{0.877} \\
+\bottomrule
+\end{tabular}
+\caption{The two detectors on identical validation frames. The classical
+detector is the more precise of the two but misses far more, and the gap widens
+as the IoU threshold rises: hysteresis recovers a filament's bright core
+reliably and its faint extremities unreliably, which costs most at
+AP@0.75.}\label{tab:headtohead}
+\end{center}
 \end{table}
 
-\subsubsection{Random Forest}
-Random forest is a spin-off of the decision learning algorithm where many decision trees are created over an arbitrary subspace and the decision at each split of the tree is done by a random process instead of a discrete optimized split, and the mode of the classfications of these individual decision trees forms the final output classification, in our case Insults/Not an insult. A parameter that needed to be set was the maximum depth of tree. This is an important factor to determine classifier accuracy as deeper trees reduce bias and more trees reduce variance. The max depth of the trees was set to be the maximum possible, which is the size of attribute set. 
-\begin{table}[h]
- \begin{center}
-  %\tabcolsep=0.11cm
-\begin{tabular}{|l|l|}
+\subsection{Post-processing}
 
-	\hline
-     Metric & Value  \\
-     \hline\hline
-     Correctly Classified Instances & 79.675\% \\
-     Cross-Validation Accuracy & 78.2366\% \\
-	 Mean Absolute Error& 0.1841 \\
-     \hline
-     
- \end{tabular}
-\caption{Evaluation metrics using Random Forest algorithm}\label{table-1}
- \end{center}
-\end{table}
-
-
-
-\subsubsection{AdaBoostM1}
-\newcite{Kohavi96} discusses the NBTree  which is a combination of the decision tree classifier and naive bayes classifier where the decision-tree nodes contain univariate splits as regular decision-trees, but the leaves are comprised of Naive-Bayesian classifiers. As we can see the classifier when used as the WeakLearn algorithm for the AdaBoostM1 wth iteration count as 100 we see the following results. Table~\ref{table-5} illustrates the metrics evaluated using this approach
+Table \ref{tab:postproc} isolates each post-processing step applied to the
+network's output.
 
 \begin{table}[h]
- \begin{center}
-  %\tabcolsep=0.11cm
-\begin{tabular}{|l|l|}
-
-	\hline
-     Metric & Value  \\
-     \hline\hline
-     Correctly Classified Instances & 79.93 \% \\
-	 Incorrectly Classified Instances & 20.07 \% \\
-	 Mean Absolute Error&  0.1696 \\
-     \hline
-     
- \end{tabular}
-\caption{Evaluation metrics using AdaBoostM1 with NBTree WeakLearn}\label{table-5}
- \end{center}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Configuration & IoU & clDice & Hit rate \\
+\midrule
+Threshold only & 0.866 & 0.972 & 0.958 \\
+$+$ small-object removal & \textbf{0.878} & \textbf{0.977} & 0.958 \\
+$+$ fragment merging & \textbf{0.878} & \textbf{0.977} & 0.958 \\
+$+$ sunspot rejection & 0.733 & 0.849 & 0.729 \\
+\bottomrule
+\end{tabular}
+\caption{Post-processing applied to FilaNet. Shape-based sunspot rejection is
+actively harmful here.}\label{tab:postproc}
+\end{center}
 \end{table}
 
-In addition, the (LMT) logistic model tree classifier was also used as a WeakLearn algorithm that replaced the NBTree classifier in the previous step. The objective was to learn weak learners that minimize training error on each iteration of the set and thus resultant hypthesis is an aggregation of weak learners that when combined, provide a strong learning classifier. The LMT classifier when used as the weka learner with same number of iterations was observered to perform better than the NBTree classifier on the test data set. 
+The last row is the most useful result in this paper. Shape-based sunspot
+rejection is essential to the classical detector, cutting its false discovery
+rate from $0.60$ to $0.14$, and it is actively harmful applied to the network,
+costing $0.145$ IoU and a quarter of the hit rate. The reason is clear once
+measured: the network never predicts sunspots in the first place, so the filter
+has none to remove and deletes genuine short, compact filaments instead. A
+post-processing step justified on one detector cannot be assumed to transfer to
+another, and the cost of assuming otherwise here was larger than the difference
+between any two architectures we tried.
+
+\subsection{Ablation}
+
+Table \ref{tab:ablation} reports variants that differ from the full model in
+exactly one respect, so differences are attributable.
 
 \begin{table}[h]
- \begin{center}
-  %\tabcolsep=0.11cm
-\begin{tabular}{|l|l|}
-
-	\hline
-     Metric & Value  \\
-     \hline\hline
-     Correctly Classified Instances & 80.846 \% \\
-     Cross-validation Accuracy & 79.14\% \\
-	 Mean Absolute Error& 0.1291 \%\\
-     \hline
-     
- \end{tabular}
-\caption{Evaluation metrics using LMT  Classifier as WeakLearn for AdaBoostM1 algorithm}\label{table-6}
- \end{center}
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Variant & IoU & Dice & clDice & MSIoU \\
+\midrule
+Full model & 0.861 & 0.925 & \textbf{0.971} & 0.824 \\
+No clDice & \textbf{0.884} & \textbf{0.938} & 0.960 & \textbf{0.851} \\
+No edge attention & 0.860 & 0.925 & 0.969 & 0.821 \\
+No auxiliary heads & 0.857 & 0.923 & 0.971 & 0.821 \\
+No deep supervision & 0.865 & 0.928 & 0.968 & 0.823 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation on synthetic data, pixel-level validation scores before
+instance extraction.}\label{tab:ablation}
+\end{center}
 \end{table}
 
-\section{Related Work}
-As discussed by \newcite{heh2014}, there were a number of things that increased accuracy to his project. These include, adding Google's bad word list to count the number of bad words in the sentence as a feature, the inclusion Stanford's NLTK tokenizer and the Lancaster Stemmer. Such methods greatly increased the cross validation accuracy as shown in Figure 1. 
+Only one component produces a clearly directional effect at this scale. The
+auxiliary heads and deep supervision move IoU by $-0.004$ and $+0.005$
+respectively, which is inside run-to-run variation on six validation frames.
 
-\begin{figure}[h]
-\includegraphics[width=8.0cm,height=3.90cm,scale=1.0]{accuracy.png}
-\caption{Figure: Cross Validation Accuracy Measure \newcite{heh2014}}
-\end{figure}
+The clDice term does what it is designed to do, and it is a trade rather than a
+free gain: removing it \emph{raises} pixel IoU by $0.023$ while \emph{lowering}
+clDice by $0.011$. It spends area agreement to buy topological fidelity. Whether
+that is the right purchase depends on what is being scored; for a
+fine-structure criterion it is, and clDice and MSIoU are the metrics that
+register it, while pixel IoU by construction cannot.
 
-Another interesting feature that was applied by \newcite{goyal2014} was the inclusion of the count of words that followed the phrases such as "you are a", "you're" "you" "your". It was observed that this feature was a constant theme in abusive comments, as they were the most direct way to append an insult to one of these second person phrases. In their paper, \newcite{goyal2014} discuss how they had originally had a classifier right around ~82\% accurate and with the inclusion of this feature it rose to ~86\%, as it was found to be a strong classifier. Recently, another paper was published on Twitter insult detection, by \newcite{hong2012}, performing statistical topic and lexicon modelling on a set of Twitter tweets, using Bootrapping algorithms in NLP.
+Edge attention shows no measurable effect on this data: $0.860$ against
+$0.861$. We report this as a null result rather than quietly omitting it, and
+the same caveat applies to the auxiliary heads and deep supervision. These are
+not evidence that the mechanisms fail, but evidence that this benchmark cannot
+resolve them: synthetic barbs come from a simple generative model with clean
+edges, leaving little for an edge prior to contribute; the ablation model is
+deliberately small so that it trains on a CPU; and six validation frames is a
+thin basis for separating differences of half a per cent. All three components
+should be treated as unproven until the ablation is repeated on MAGFiLO, which
+\texttt{scripts/ablation.py} does in one command.
 
-\section{Future work}
+\section{Limitations and further work}
 
-\subsection{Adding a customized stop words and bad words list}
-The default WEKA stop words list was used for this project however in the future, a more targeted stop words list could be generated. A dictionary of commonly used bad words was released by Google, which they use to flag abuses on their own social media platforms. By integrating a bad words list and a words list that contains common religions, sexual orientations, and generally racy topics could also be included as a feature where its presence in a comment would be a good classifier for insult detection.
-\subsection{Ability to detect sarcasm}
-Sometimes people use sarcasm to hint offensive dialog. An example of this, is when a user offends a man of color by saying, "you are too fair skinned to be invited to the party". Currently, this program is unable to detect such sarcastic comments that may offend users but with the help of NLP projects such as Stanford's coreNLP this may be achieved by further understanding the structure of the sentence constructed. 
+Three limitations are worth stating plainly.
 
-\subsection{Collecting more data}
-To better classifier our data we could collect more data from the social networking platform such as the userIds of the sender and the recipient, the location and date/time of comment posted and the age of users to better classify the instances. For instance, some phrases such as "that artist's voice is sick!" would be interpreted with a positive connotation to a young crowd but an older crowd would find it insulting. In addition, certain users who resort to expletive terms would be more likely to do so, in the future, so it would be a good classifier. Furthermore, data such as number of threads following a post could also be a good classifier, as its natural that one insult follows many more counter insults. Such a strong classifer constructed from these attributes could help social networking platforms to take some action against the users violating their terms and policies or at least dissuade users from using such expletives.
+First, the classical detector's coverage prior must be set from data. It is
+interpretable and easy to measure, but it is not automatic, and a badly chosen
+value costs recall directly.
 
+Second, fragment merging is purely geometric. It uses endpoint proximity and
+spine alignment, and cannot use the photometric evidence in the gap between two
+fragments. Scoring candidate bridges by the image intensity along them would
+likely be more reliable.
 
+Third, the chirality labels in MAGFiLO are unused here. Since barbs determine
+chirality, and since the barb-preserving losses used here exist precisely to
+retain them, adding a chirality classification head is a natural extension that
+would also act as a further supervisory signal on the barbs themselves.
 
-\section{Conclusions}
+\section{Conclusion}
 
-It is clear from the metric tables of each of the classifier algorithms that the best classifier in terms of the most number of correctly classified instances is the SVM algorithm , with a close second being the AdaBoost.M1 algorithm using the LMT algorithm as its weakLearn algorithm. However, the classifier performance would still be considered low,overall, and some of the techniques that could be applied to increase the accuracy have been discussed in Related Work and Future Work.In addition,it was observed that some of the most negatively weighted words included "fuck" and "idiot". We can conclude that we have obtained ~82\% accuracy on the test data set and that the analysis of machine learning is based on not only the algorithm that we apply but also how we handle the data.
-
-\section{Acknowledgement}
-This was project was made possible by the guidance and support of Professor Dan Roth who introduced the students to the WEKA machine learning tool early on in the semester in the form of a problem set. This added some comfort  with using the tool and eventually led to the execution of this project.
-
+Segmenting solar filaments well is mostly a question of refusing to optimise
+the wrong objective. Area-based losses are systematically blind to the thin
+structures that carry the scientific content, and no amount of architectural
+work fixes that. Combining topology-aware supervision with physically motivated
+preprocessing, edge-guided attention and geometric instance reasoning gives a
+system that is designed for what the challenge actually scores. A complete
+implementation, a training-free baseline, the full metric suite and a synthetic
+generator that lets the pipeline be verified without the competition data are
+released alongside this report.
 
 \bibliographystyle{acl}
 \bibliography{sample}

@@ -51,7 +51,7 @@ Solar_Filament_Segmentation_Challenge_2026/
 │   ├── train/
 │   │   ├── xxxxx.jpg
 │   │   ├── xxxxx.jpg
-│   │   └── annotations.json       (whatever the JSON is actually called)
+│   │   └── MAGFiLO_1.0_Annotations_kaggle2026_train.json
 │   └── test/
 │       ├── yyyyy.jpg
 │       └── yyyyy.jpg
@@ -71,13 +71,11 @@ ln -s /path/to/your/data data          # macOS / Linux
 or pass the paths explicitly to every command with `--annotations` and
 `--image-dir` instead of relying on the default layout.
 
-Find the real name of your annotation file:
-
-```bash
-ls data/train/*.json
-```
-
-Use that name wherever the commands below say `annotations.json`.
+The annotation JSON can be called anything — MAGFiLO's is
+`MAGFiLO_1.0_Annotations_kaggle2026_train.json`. **You do not need to type it.**
+Every script takes `--data-dir data` and finds the JSON, the training images and
+the test images itself. If you do pass a name that does not exist, it looks for
+the real one next to it and tells you which it used.
 
 ## 4. Check the data before training
 
@@ -100,8 +98,7 @@ score within minutes and confirms the whole pipeline works on your data.
 
 ```bash
 python scripts/evaluate.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+    --data-dir data \
     --classical --limit 20
 ```
 
@@ -109,8 +106,7 @@ python scripts/evaluate.py \
 
 ```bash
 python scripts/train.py --config configs/default.yaml \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+    --data-dir data \
     --cache-dir data/cache \
     --output-dir runs/filanet \
     --epochs 60
@@ -136,8 +132,7 @@ Resume or retrain by rerunning the same command with a different
 
 ```bash
 python scripts/evaluate.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+    --data-dir data \
     --cache-dir data/cache \
     --checkpoint runs/filanet/best.pt \
     --out runs/filanet/scores.json
@@ -170,8 +165,7 @@ Its coverage prior trades recall against precision and is dataset-specific.
 
 ```bash
 python scripts/tune_classical.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+    --data-dir data \
     --cache-dir data/cache --limit 40
 ```
 
@@ -183,8 +177,7 @@ those conclusions:
 
 ```bash
 python scripts/ablation.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+    --data-dir data \
     --cache-dir data/cache --epochs 40
 ```
 
@@ -192,6 +185,10 @@ python scripts/ablation.py \
 
 **`no images found under data/test`** — check the extension is one of `.jpg`,
 `.jpeg`, `.png`, `.fits`, `.npy`. Anything else is skipped.
+
+**`No annotation JSON found`** — pass `--data-dir data`, or point
+`--annotations` straight at the file. If more than one JSON sits in the folder,
+the error lists them so you can pick.
 
 **`no image for 'xxx.fits' under data/train`** — the JSON names files that are
 not there. The loader already tries the same stem with any known extension, so

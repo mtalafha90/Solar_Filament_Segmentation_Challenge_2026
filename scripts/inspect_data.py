@@ -26,42 +26,16 @@ import _bootstrap  # noqa: F401
 import numpy as np
 
 from filaseg.data.coco import CHIRALITY_NAMES, load_coco, rescale_record, summarise
-from filaseg.data.io import FITS_SUFFIXES, IMAGE_SUFFIXES, find_image, read_image
+from filaseg.data.io import find_image, read_image
+from filaseg.data.layout import DATA_SUFFIXES as SUFFIXES
+from filaseg.data.layout import count_images, discover, resolve_annotations
 from filaseg.preprocessing.photometry import preprocess
-
-SUFFIXES = FITS_SUFFIXES | IMAGE_SUFFIXES | {".npy"}
 
 
 def find_layout(data_dir: Path) -> tuple[Path | None, Path | None, Path | None]:
-    """Work out where the annotations, training images and test images live.
-
-    Handles the usual competition layout of ``data/train`` plus ``data/test``,
-    with the annotation JSON anywhere inside the training folder.
-    """
-    train_dir = next(
-        (d for d in (data_dir / "train", data_dir / "training", data_dir) if d.is_dir()),
-        None,
-    )
-    test_dir = next(
-        (d for d in (data_dir / "test", data_dir / "testing") if d.is_dir()), None
-    )
-
-    annotations = None
-    for candidate_dir in [d for d in (train_dir, data_dir) if d is not None]:
-        candidates = sorted(candidate_dir.glob("*.json")) + sorted(
-            candidate_dir.glob("*/*.json")
-        )
-        if candidates:
-            # Prefer the largest, which is almost always the real annotation file.
-            annotations = max(candidates, key=lambda p: p.stat().st_size)
-            break
-    return annotations, train_dir, test_dir
-
-
-def count_images(directory: Path | None) -> list[Path]:
-    if directory is None or not directory.is_dir():
-        return []
-    return sorted(p for p in directory.rglob("*") if p.suffix.lower() in SUFFIXES)
+    """Locate the annotations, training images and test images."""
+    layout = discover(data_dir)
+    return layout.annotations, layout.train_dir, layout.test_dir
 
 
 def main() -> None:
@@ -97,10 +71,10 @@ def main() -> None:
         extensions = Counter(p.suffix.lower() for p in train_images)
         print(f"  formats: {dict(extensions)}")
 
-    if annotations is None or not Path(annotations).exists():
-        raise SystemExit(
-            "\nNo annotation JSON found. Pass --annotations explicitly."
-        )
+    try:
+        annotations = resolve_annotations(annotations, image_dir, args.data_dir)
+    except FileNotFoundError as error:
+        raise SystemExit(f"\n{error}") from error
 
     records, meta = load_coco(annotations)
     stats = summarise(records)

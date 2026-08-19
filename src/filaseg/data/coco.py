@@ -27,13 +27,42 @@ CHIRALITY_KEYS = ("chirality", "chirality_label", "magnetic_chirality", "handedn
 
 CHIRALITY_NAMES = {0: "unknown", 1: "sinistral", 2: "dextral"}
 
+# COCO nominally uses integer ids, but real releases often do not. MAGFiLO keys
+# its observations by the original GONG frame name, for example
+# '040301-20140609195854Bh', which carries the site and timestamp. Those ids are
+# meaningful and must survive round-tripping into a submission, so we keep them
+# exactly as given rather than forcing them to integers.
+ImageId = int | str
+
+
+def normalise_id(value: Any) -> ImageId:
+    """Keep an id as an int when it truly is one, otherwise as a string.
+
+    Integer-valued ids stay integers so that plain COCO files behave exactly as
+    before; anything else is preserved verbatim.
+    """
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, float) and float(value).is_integer():
+        return int(value)
+    text = str(value)
+    # A string of digits is an integer id written as text.
+    if text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    return text
+
 
 @dataclass
 class FilamentAnnotation:
     """One annotated filament."""
 
-    annotation_id: int
-    image_id: int
+    annotation_id: ImageId
+    image_id: ImageId
     bbox: tuple[float, float, float, float]  # COCO order: x, y, width, height
     segmentation: Any
     area: float = 0.0
@@ -50,7 +79,7 @@ class FilamentAnnotation:
 class ImageRecord:
     """One annotated observation."""
 
-    image_id: int
+    image_id: ImageId
     file_name: str
     height: int
     width: int
@@ -224,9 +253,9 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
 
     meta = {key: raw.get(key) for key in ("info", "licenses", "categories")}
 
-    records: dict[int, ImageRecord] = {}
+    records: dict[ImageId, ImageRecord] = {}
     for entry in raw.get("images", []):
-        image_id = int(entry["id"])
+        image_id = normalise_id(entry["id"])
         known = {"id", "file_name", "height", "width"}
         records[image_id] = ImageRecord(
             image_id=image_id,
@@ -238,7 +267,7 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
 
     skipped = 0
     for entry in raw.get("annotations", []):
-        image_id = int(entry["image_id"])
+        image_id = normalise_id(entry["image_id"])
         record = records.get(image_id)
         if record is None:
             skipped += 1
@@ -246,7 +275,9 @@ def load_coco(path: str | Path) -> tuple[list[ImageRecord], dict[str, Any]]:
         bbox = entry.get("bbox") or [0.0, 0.0, 0.0, 0.0]
         record.annotations.append(
             FilamentAnnotation(
-                annotation_id=int(entry.get("id", len(record.annotations) + 1)),
+                annotation_id=normalise_id(
+                    entry.get("id", len(record.annotations) + 1)
+                ),
                 image_id=image_id,
                 bbox=tuple(float(v) for v in bbox[:4]),  # type: ignore[arg-type]
                 segmentation=entry.get("segmentation"),

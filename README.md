@@ -105,22 +105,21 @@ Then train, score and predict:
 
 ```bash
 # Train
-python scripts/train.py --config configs/default.yaml \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+python scripts/train.py --config configs/default.yaml --data-dir data \
     --cache-dir data/cache --output-dir runs/filanet
 
 # Score on the held-out split
-python scripts/evaluate.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
-    --checkpoint runs/filanet/best.pt
+python scripts/evaluate.py --data-dir data --checkpoint runs/filanet/best.pt
 
 # Predict on test/ and write a submission
 python scripts/predict.py --images data/test \
     --checkpoint runs/filanet/best.pt \
     --out submission.json --format coco
 ```
+
+`--data-dir` finds the annotation JSON, the training images and the test images
+by itself, whatever the JSON is called. Pass `--annotations` and `--image-dir`
+instead if your layout is unusual.
 
 Swap `--checkpoint …` for `--classical` anywhere above to use the training-free
 detector, which needs no weights and runs in a couple of seconds per frame.
@@ -129,6 +128,9 @@ Two practical notes:
 
 - The first epoch is slow because every frame is preprocessed; results are
   cached to `--cache-dir` and later epochs read them straight back.
+- Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
+  observations by the original GONG frame name (`040301-20140609195854Bh`)
+  rather than an integer, and submissions carry those names back unchanged.
 - If the distributed JPEGs were resized relative to the frames the annotations
   were drawn on, the loader detects the mismatch, warns once, and **rescales the
   annotations to the image** rather than shrinking the image — barbs do not
@@ -141,9 +143,7 @@ dataset-specific. `inspect_data.py` prints a range to search and the exact
 command:
 
 ```bash
-python scripts/tune_classical.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train --limit 40
+python scripts/tune_classical.py --data-dir data --limit 40
 ```
 
 ---
@@ -371,7 +371,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-115 tests cover geometry, photometry, annotation parsing and encoding, the loss
+128 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

@@ -21,6 +21,7 @@ import _bootstrap  # noqa: F401
 
 import yaml
 
+from filaseg.data.layout import discover, resolve_annotations
 from filaseg.losses import LossWeights
 from filaseg.models.filanet import FilaNetConfig
 from filaseg.train import TrainConfig, train
@@ -39,6 +40,8 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
     for name, value in vars(args).items():
         if name in ("config",) or value is None:
             continue
+        if name == "data_dir":
+            continue
         if name in TrainConfig.__dataclass_fields__:
             settings[name] = value
 
@@ -55,7 +58,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=str, help="YAML file of defaults")
-    parser.add_argument("--annotations", type=str)
+    parser.add_argument("--data-dir", type=str, dest="data_dir",
+                        help="dataset root holding train/ and test/; the "
+                             "annotations and image directory are found inside it")
+    parser.add_argument("--annotations", type=str,
+                        help="annotation JSON; discovered automatically if omitted")
     parser.add_argument("--image-dir", type=str, dest="image_dir")
     parser.add_argument("--cache-dir", type=str, dest="cache_dir")
     parser.add_argument("--output-dir", type=str, dest="output_dir")
@@ -71,9 +78,21 @@ def main() -> None:
     parser.add_argument("--no-amp", dest="amp", action="store_false", default=None)
     args = parser.parse_args()
 
+    # Resolve the dataset before building the config, so a mistyped or omitted
+    # annotation filename is corrected rather than reported as missing.
+    if args.data_dir and not args.image_dir:
+        layout = discover(args.data_dir)
+        args.image_dir = str(layout.train_dir) if layout.train_dir else None
+    try:
+        args.annotations = str(
+            resolve_annotations(args.annotations, args.image_dir, args.data_dir)
+        )
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from error
+
     config = build_config(args)
-    if not config.annotations or not config.image_dir:
-        raise SystemExit("--annotations and --image-dir are required")
+    if not config.image_dir:
+        raise SystemExit("--image-dir is required (or pass --data-dir)")
 
     print(f"training on {config.device}, writing to {config.output_dir}")
     best = train(config)

@@ -104,7 +104,10 @@ def write_coco(
                 segmentation = polygons
             results.append(
                 {
-                    "image_id": int(image_id),
+                    # Kept exactly as the dataset gave it. MAGFiLO ids are the
+                    # original GONG frame names, not integers, and a grader
+                    # matching on them needs them back unchanged.
+                    "image_id": image_id,
                     "category_id": 1,
                     "segmentation": segmentation,
                     "bbox": [

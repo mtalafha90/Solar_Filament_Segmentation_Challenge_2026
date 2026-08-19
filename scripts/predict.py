@@ -22,6 +22,7 @@ import _bootstrap  # noqa: F401
 import numpy as np
 
 from filaseg.classical import detect
+from filaseg.data.coco import normalise_id
 from filaseg.data.io import IMAGE_SUFFIXES, FITS_SUFFIXES, read_image
 from filaseg.inference import InferenceConfig, predict
 from filaseg.postprocess.instances import InstanceConfig
@@ -101,13 +102,13 @@ def main() -> None:
             print(f"  {index}/{len(paths)}  ({time.time() - started:.0f}s)", flush=True)
 
     if args.format == "coco":
-        # COCO results need integer image ids; use the numeric part of the name
-        # when there is one, otherwise fall back to the position in the list.
-        coco_records = []
-        for position, (name, labels, probability) in enumerate(records, start=1):
-            digits = "".join(c for c in name if c.isdigit())
-            image_id = int(digits) if digits else position
-            coco_records.append((image_id, labels, probability))
+        # The image id is the file stem, which is what the annotations use.
+        # MAGFiLO keys observations by the original GONG frame name, so deriving
+        # an integer from it would produce ids the grader cannot match.
+        coco_records = [
+            (normalise_id(name), labels, probability)
+            for name, labels, probability in records
+        ]
         count = write_coco(args.out, coco_records)
         print(f"wrote {count} instances to {args.out}")
     elif args.format == "csv":

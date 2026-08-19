@@ -16,6 +16,7 @@ together at inference.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -36,7 +37,7 @@ except ImportError:  # pragma: no cover - exercised only without torch
 
 from ..preprocessing.disk import SolarDisk
 from ..preprocessing.photometry import preprocess
-from .coco import ImageRecord, load_coco, rescale_record
+from .coco import ImageId, ImageRecord, load_coco, normalise_id, rescale_record
 from .io import find_image, read_image
 from .targets import boundary_map, distance_weight, spine_heatmap
 
@@ -54,7 +55,7 @@ class PreparedObservation:
     boundary: np.ndarray  # (H, W) float32
     weight: np.ndarray  # (H, W) float32 per-pixel loss weights
     disk: SolarDisk
-    image_id: int = 0
+    image_id: ImageId = 0
     file_name: str = ""
 
     def input_stack(self) -> np.ndarray:
@@ -148,7 +149,7 @@ class MagfiloDataset:
         annotations: str | Path,
         image_dir: str | Path,
         cache_dir: str | Path | None = None,
-        image_ids: Sequence[int] | None = None,
+        image_ids: Sequence[ImageId] | None = None,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
@@ -158,7 +159,7 @@ class MagfiloDataset:
         self._warned_about_size = False
         records, self.meta = load_coco(annotations)
         if image_ids is not None:
-            wanted = set(int(i) for i in image_ids)
+            wanted = {normalise_id(i) for i in image_ids}
             records = [r for r in records if r.image_id in wanted]
         self.records = records
 
@@ -166,13 +167,23 @@ class MagfiloDataset:
         return len(self.records)
 
     @property
-    def image_ids(self) -> list[int]:
+    def image_ids(self) -> list[ImageId]:
         return [record.image_id for record in self.records]
 
     def _cache_path(self, record: ImageRecord) -> Path | None:
+        """Cache file for one observation.
+
+        Image ids are not necessarily integers -- MAGFiLO uses the original GONG
+        frame name -- so the id is sanitised into something safe for a filename
+        and given a short hash suffix, which keeps two ids that sanitise to the
+        same text from colliding.
+        """
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"{record.image_id:07d}.npz"
+        raw = str(record.image_id)
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)[:80]
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        return self.cache_dir / f"{safe}_{digest}.npz"
 
     def __getitem__(self, index: int) -> PreparedObservation:
         record = self.records[index]
@@ -190,7 +201,7 @@ class MagfiloDataset:
                     boundary=blob["boundary"],
                     weight=blob["weight"],
                     disk=SolarDisk(*[float(v) for v in blob["disk"]]),
-                    image_id=int(blob["image_id"]),
+                    image_id=normalise_id(blob["image_id"].item()),
                     file_name=str(blob["file_name"]),
                 )
 
@@ -228,7 +239,7 @@ class MagfiloDataset:
                     [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
                     dtype=np.float64,
                 ),
-                image_id=prepared.image_id,
+                image_id=str(prepared.image_id),
                 file_name=prepared.file_name,
             )
         return prepared

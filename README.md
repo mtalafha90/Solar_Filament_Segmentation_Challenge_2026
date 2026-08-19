@@ -14,6 +14,13 @@ run and score them:
 | **FilaNet** | An edge-guided, multi-task U-Net | Yes |
 | **Classical detector** | Ridge filtering with hysteresis thresholding | No |
 
+> **Use FilaNet for real data.** Measured on GONG-like frames, the classical
+> detector cannot exceed **IoU ≈ 0.08 at any threshold** — filament contrast
+> against the chromospheric network is around 1σ, far too low for a hand-built
+> score. It is worth running once as a pipeline check and as a fallback on
+> observations unlike anything in training, but it is not a competitive
+> baseline. See [Results](#results).
+
 ---
 
 ## Why this problem is not ordinary segmentation
@@ -268,10 +275,11 @@ connected-component labelling does not give you:
   rule: enable it for a detector that cannot reject sunspots itself, leave it
   off for one that can.
 
-### 6. The classical detector
+### 6. The classical detector, and its hard limit
 
-No training, no weights, useful as a reference and as a fallback on observations
-unlike anything in the training set. It scores each pixel by combining a
+No training, no weights. Useful for checking the pipeline runs on your data, and
+as a fallback on observations unlike anything in the training set — but **not a
+competitive baseline on real observations**, for a reason worth understanding. It scores each pixel by combining a
 multi-scale Hessian ridge response — which responds to elongated dark structures
 and largely ignores round ones — with the local intensity deficit, then applies
 **hysteresis thresholding**: a high threshold seeds confident filament cores,
@@ -293,6 +301,17 @@ around it — rather than guessing.
 > comparable size, whereas filaments are a per cent or two of the disk, so it
 > over-segments sparse frames badly — on synthetic data a frame with 1.2% true
 > coverage was split at 21%.
+
+**Why it cannot win.** On easy synthetic frames, where filaments sit 3.7σ above
+the quiet Sun, this reaches IoU 0.62. On realistic frames, where the contrast is
+about 1σ and the chromospheric network supplies competing texture, sweeping
+*every* threshold on the score map gives a best attainable IoU of **0.083**.
+That is a property of the score, not the threshold: at 0.75% prevalence and an
+ROC area of 0.75, the top percentile of any such score is dominated by the 99%
+background class. `scripts/diagnose_classical.py` measures this ceiling on your
+data in about a minute, so you can see it rather than take it on trust. A
+network wins here because it pools evidence over a whole neighbourhood and
+learns the background texture, neither of which a per-pixel score can do.
 
 ---
 
@@ -391,7 +410,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-153 tests cover geometry, photometry, annotation parsing and encoding, the loss
+157 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

@@ -91,10 +91,20 @@ It finds `train/`, `test/` and the JSON on its own. Read the **SUGGESTED
 SETTINGS** block at the end — it prints the `pos_weight` and `patch_size` to
 use below, and the coverage range for the classical detector.
 
-## 5. Try the training-free detector first
+## 5. Check the pipeline with the training-free detector
 
-No training, no GPU, a couple of seconds per frame. This gives you a baseline
-score within minutes and confirms the whole pipeline works on your data.
+No training, no GPU, about five seconds per frame. Run it to confirm the whole
+pipeline works on your data — **not** to get a competitive score. On real GONG
+observations this detector cannot exceed IoU ≈ 0.08 at any threshold, because
+filament contrast against the chromospheric network is around 1σ. Confirm that
+for your own data with:
+
+```bash
+python scripts/diagnose_classical.py --data-dir data --limit 5
+```
+
+It reports the best IoU any threshold on the score map could reach. If that is
+low, skip `tune_classical.py` entirely and train FilaNet.
 
 ```bash
 python scripts/evaluate.py \
@@ -173,7 +183,8 @@ image or the pixel coverage look nothing like the training statistics that
 
 ## 9. Optional: tune the classical detector
 
-Its coverage prior trades recall against precision and is dataset-specific.
+Only worth doing if `diagnose_classical.py` reported a workable ceiling. Its
+coverage prior trades recall against precision and is dataset-specific;
 `inspect_data.py` prints the range to search:
 
 ```bash

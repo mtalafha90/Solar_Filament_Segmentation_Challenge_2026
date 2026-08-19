@@ -270,3 +270,56 @@ def test_default_post_processing_keeps_a_compact_filament():
     probability[60:70, 40:58] = 1.0
     labels = extract_instances(probability, config=InstanceConfig(min_area=30))
     assert labels.max() == 1
+
+
+def test_filter_scales_follow_the_solar_radius():
+    """A filament's width in pixels depends entirely on the plate scale."""
+    from filaseg.classical import ClassicalConfig, scale_to_disk
+
+    config = ClassicalConfig()
+    at_reference = scale_to_disk(config, config.reference_radius)
+    assert at_reference.scales == config.scales
+
+    # A GONG frame's disk is about four times the reference radius.
+    scaled = scale_to_disk(config, 4 * config.reference_radius)
+    assert scaled.scales == pytest.approx(tuple(4 * s for s in config.scales))
+    assert scaled.background_scale == pytest.approx(4 * config.background_scale)
+
+
+def test_scale_to_disk_can_be_switched_off():
+    from filaseg.classical import ClassicalConfig, scale_to_disk
+
+    config = ClassicalConfig(scale_with_radius=False)
+    assert scale_to_disk(config, 2000.0).scales == config.scales
+
+
+def test_scale_to_disk_ignores_a_nonsensical_radius():
+    from filaseg.classical import ClassicalConfig, scale_to_disk
+
+    config = ClassicalConfig()
+    for radius in (0.0, -5.0, float("nan")):
+        assert scale_to_disk(config, radius).scales == config.scales
+
+
+def test_detector_scales_itself_to_the_frame():
+    """The same Sun at two resolutions must be detected about equally well."""
+    from filaseg.classical import ClassicalConfig, detect
+    from filaseg.data.synthetic import generate_observation
+    from filaseg.metrics import evaluate
+    from filaseg.preprocessing.photometry import preprocess
+
+    scores = {}
+    for size, width_scale in ((256, 1.0), (512, 2.0)):
+        observation = generate_observation(
+            size=size, n_filaments=6, n_sunspots=3, seed=17, width_scale=width_scale
+        )
+        _, valid, _ = preprocess(observation.image)
+        coverage = (observation.semantic_mask & valid).sum() / valid.sum()
+        labels = detect(
+            observation.image, ClassicalConfig(expected_coverage=coverage / 3)
+        )
+        scores[size] = evaluate(labels, observation.instance_map, valid)["iou"]
+
+    assert scores[256] > 0.3 and scores[512] > 0.3
+    # Neither resolution should be dramatically worse than the other.
+    assert min(scores.values()) > 0.6 * max(scores.values())

@@ -23,7 +23,7 @@ are connected to a confident core, while equally faint noise elsewhere is not.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -38,7 +38,18 @@ class ClassicalConfig:
     """Settings for :func:`detect`."""
 
     scales: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0)
-    """Ridge filter widths in pixels, covering thin barbs to fat filament bodies."""
+    """Ridge filter widths in pixels, covering thin barbs to fat filament bodies.
+
+    Quoted for a disk of ``reference_radius``. Unless ``scale_with_radius`` is
+    turned off these are rescaled to the disk actually measured, because a
+    filament's width in pixels depends entirely on the plate scale: the same
+    structure spans four times as many pixels on a 2048-pixel GONG frame as on a
+    512-pixel thumbnail, and a filter tuned for one is blind to the other.
+    """
+    scale_with_radius: bool = True
+    """Rescale ``scales`` and ``background_scale`` to the measured solar radius."""
+    reference_radius: float = 225.0
+    """Solar radius, in pixels, that ``scales`` and ``background_scale`` assume."""
     ridge_weight: float = 0.3
     """Blend between the ridge response (1.0) and the plain intensity deficit (0.0).
 
@@ -252,6 +263,34 @@ def _rank_normalise(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return out
 
 
+def scale_to_disk(config: ClassicalConfig, radius: float) -> ClassicalConfig:
+    """Rescale the filter widths to the disk actually measured.
+
+    Filament widths are a property of the Sun, not of the sensor, so every
+    length in the detector has to follow the plate scale. Without this, the
+    defaults silently stop working the moment the data is distributed at a
+    different resolution from the one they were tuned at.
+
+    Args:
+        config: Settings whose lengths are quoted for ``reference_radius``.
+        radius: Solar radius measured on this frame, in pixels.
+
+    Returns:
+        A copy with ``scales`` and ``background_scale`` rescaled, or the
+        original when ``scale_with_radius`` is off.
+    """
+    if not config.scale_with_radius or config.reference_radius <= 0:
+        return config
+    factor = float(radius) / float(config.reference_radius)
+    if not np.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 0.05:
+        return config
+    return replace(
+        config,
+        scales=tuple(float(s) * factor for s in config.scales),
+        background_scale=float(config.background_scale) * factor,
+    )
+
+
 def choose_thresholds(
     inside: np.ndarray, config: ClassicalConfig | None = None
 ) -> tuple[float, float]:
@@ -316,7 +355,8 @@ def detect(
         ``return_score`` is set.
     """
     config = config or ClassicalConfig()
-    processed, valid, _ = preprocess(image, disk=disk)
+    processed, valid, fitted = preprocess(image, disk=disk)
+    config = scale_to_disk(config, fitted.radius)
 
     score = score_map(processed, valid, config)
     inside = score[valid]

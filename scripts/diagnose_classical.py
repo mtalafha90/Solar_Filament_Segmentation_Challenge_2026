@@ -36,6 +36,7 @@ from filaseg.classical import (
     hysteresis,
     intensity_deficit,
     ridge_response,
+    scale_to_disk,
     score_map,
 )
 from filaseg.data.dataset import MagfiloDataset
@@ -96,7 +97,7 @@ def main() -> None:
     config = ClassicalConfig()
     edges = np.array([0.0, 0.3, 0.5, 0.7, 0.85, 0.93, 0.97, 1.0])
 
-    aucs, ridge_aucs, deficit_aucs = [], [], []
+    aucs, ridge_aucs, deficit_aucs, ceilings = [], [], [], []
     contrasts, precisions_at_truth = [], []
     truth_profiles, prediction_profiles, score_profiles = [], [], []
     report_rows = []
@@ -109,9 +110,10 @@ def main() -> None:
             continue
 
         radius_map = prepared.disk.radial_map(prepared.image.shape)
-        score = score_map(prepared.image, valid, config)
-        ridge = ridge_response(prepared.image, config.scales)
-        deficit = intensity_deficit(prepared.image, valid, config.background_scale)
+        scaled = scale_to_disk(config, prepared.disk.radius)
+        score = score_map(prepared.image, valid, scaled)
+        ridge = ridge_response(prepared.image, scaled.scales)
+        deficit = intensity_deficit(prepared.image, valid, scaled.background_scale)
 
         inside = valid
         labels = truth[inside]
@@ -127,18 +129,29 @@ def main() -> None:
         )
 
         # Of the pixels the detector would seed on, how many are real filaments?
-        n_seed = max(1, int(config.expected_coverage * valid.sum()))
+        n_seed = max(1, int(scaled.expected_coverage * valid.sum()))
         flat_scores = score[inside]
         cut = np.partition(flat_scores, -n_seed)[-n_seed]
         top = score >= cut
         precisions_at_truth.append(float((top & truth).sum() / max(top.sum(), 1)))
 
-        low, high = choose_thresholds(score[inside], config)
+        low, high = choose_thresholds(score[inside], scaled)
         predicted = extract_instances(
             hysteresis(score, low, high, valid).astype(np.float32),
             valid,
             InstanceConfig(reject_round=True),
         )
+
+        # Sweep every threshold and record the best pixel IoU attainable. If
+        # this is low, the score map is the problem and no tuning can help.
+        flat = score[inside]
+        labels_flat = labels
+        order = np.argsort(-flat)
+        hits = np.cumsum(labels_flat[order])
+        seen = np.arange(1, flat.size + 1)
+        positives = int(labels_flat.sum())
+        ceiling = float((hits / (seen + positives - hits)).max())
+        ceilings.append(ceiling)
 
         truth_profiles.append(radial_profile(truth, radius_map, edges))
         prediction_profiles.append(radial_profile(predicted > 0, radius_map, edges))
@@ -170,9 +183,27 @@ def main() -> None:
     print(f"\n  filament contrast: {np.mean(contrasts):+.2f} sigma above quiet Sun")
     print("  (must be positive: preprocessing inverts, so filaments end bright)")
 
+    mean_ceiling = float(np.mean(ceilings))
+    print("\n" + "=" * 70)
+    print("WHAT IS THE BEST ANY THRESHOLD COULD DO?")
+    print("=" * 70)
+    print("  Sweeping every possible threshold on this score map, the highest")
+    print("  pixel IoU reachable is:\n")
+    print(f"    best attainable IoU   {mean_ceiling:.3f}")
+    print("\n  Your tuned result cannot exceed this. If it is already close, the")
+    print("  threshold is fine and the score map is the limit.")
+
     mean_auc = float(np.nanmean(aucs))
     print()
-    if mean_auc < 0.6:
+    if mean_ceiling < 0.25:
+        print("  VERDICT: this score map cannot segment this data, at any")
+        print("  threshold. Do not spend time on scripts/tune_classical.py --")
+        print("  the ceiling above is what it would converge to.")
+        print("  Filament contrast against the chromospheric network is simply")
+        print("  too low for a hand-built score. Train FilaNet instead; a network")
+        print("  can pool evidence over a whole neighbourhood and learn the")
+        print("  background texture, which is exactly what this cannot do.")
+    elif mean_auc < 0.6:
         print("  VERDICT: the score map barely separates filaments at all.")
         print("  No threshold can fix this. The preprocessing or the score itself")
         print("  is wrong for this data -- check the contrast line above first:")

@@ -1,5 +1,16 @@
 # Results
 
+> **Important caveat, added after running on real data.** The synthetic frames
+> used below give filaments about 3.7σ of contrast against the quiet Sun. Real
+> GONG H-alpha observations give roughly **1σ**. That difference is not a
+> detail: it is the difference between the classical detector reaching IoU 0.62
+> and it being unable to exceed **0.083 at any threshold**. Treat the classical
+> figures below as an upper bound that real data does not approach, and the
+> comparison between the two detectors as correspondingly understated in
+> FilaNet's favour. The generator now takes `filament_depth` and
+> `network_amplitude` so harder sets can be produced;
+> `scripts/diagnose_classical.py` measures the ceiling on any dataset.
+
 Every number here comes from the **synthetic** generator in
 `filaseg.data.synthetic`, because the competition data was not available in the
 environment where this work was done. They are not competition scores. Their

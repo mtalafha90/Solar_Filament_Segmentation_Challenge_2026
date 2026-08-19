@@ -209,3 +209,146 @@ def summarise_predictions(labels_list: Sequence[np.ndarray]) -> dict[str, float]
         "instance_area_min": float(np.min(areas)) if areas else 0.0,
         "instance_area_max": float(np.max(areas)) if areas else 0.0,
     }
+
+
+# --------------------------------------------------------------------------
+# The Solar Filament Segmentation Challenge 2026 submission format
+# --------------------------------------------------------------------------
+
+CHALLENGE_COLUMNS = ("filament_id", "segmentation_rle")
+
+
+def coco_rle_counts(mask: np.ndarray) -> str:
+    """Encode a mask as pycocotools compressed-RLE counts.
+
+    This is the exact string the challenge expects in ``segmentation_rle``: the
+    ``counts`` field of a pycocotools RLE, decoded to ASCII, with the ``size``
+    omitted because every frame is 2048 x 2048.
+
+    The encoding is lossless and is the organisers' own, so a submission decodes
+    back to precisely the mask that was predicted.
+
+    Args:
+        mask: Boolean mask to encode.
+
+    Returns:
+        The counts string, free of quotes and commas so it needs no escaping.
+
+    Raises:
+        ImportError: If pycocotools is not installed.
+    """
+    try:
+        from pycocotools import mask as mask_utils
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "The challenge submission format needs pycocotools. "
+            "Install it with 'pip install pycocotools'."
+        ) from exc
+
+    encoded = mask_utils.encode(np.asfortranarray(np.asarray(mask, dtype=np.uint8)))
+    counts = encoded["counts"]
+    return counts.decode("ascii") if isinstance(counts, bytes) else str(counts)
+
+
+def decode_coco_rle_counts(counts: str, height: int = 2048, width: int = 2048) -> np.ndarray:
+    """Decode challenge ``segmentation_rle`` counts back into a mask.
+
+    The inverse of :func:`coco_rle_counts`, used to check a submission before
+    uploading it.
+    """
+    from pycocotools import mask as mask_utils
+
+    rle = {"size": [int(height), int(width)], "counts": counts.encode("ascii")}
+    return np.asarray(mask_utils.decode(rle), dtype=bool)
+
+
+def image_id_from_name(file_name: str) -> str:
+    """The observation id the challenge expects, taken from an image file name.
+
+    Test images are named ``YYYYMMDDHHMMSSII.jpeg`` -- capture time and
+    instrument -- and the submission keys on that stem. Any annotator prefix
+    that a *training* id carries is stripped, since predictions are made on the
+    image, not on one annotator's reading of it.
+    """
+    stem = Path(str(file_name)).name
+    for suffix in (".gz", ".fz"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+    stem = Path(stem).stem
+    # A training id like '010401-20160920230134Lh' carries an annotator batch.
+    if "-" in stem:
+        head, _, tail = stem.partition("-")
+        if head.isdigit() and tail:
+            stem = tail
+    return stem
+
+
+def write_challenge_csv(
+    path: str | Path,
+    predictions: Iterable[tuple[str, np.ndarray]],
+    expected_shape: tuple[int, int] = (2048, 2048),
+) -> int:
+    """Write the competition's submission file.
+
+    One row per predicted filament::
+
+        filament_id,segmentation_rle
+        20150125172714Mh_1,^Vj02jo16I5O2O1`PNA]o1c0N19G1N11O3L01O4JYamT3
+        20150125172714Mh_2,...
+
+    Images with no detected filament contribute no rows, which is correct: the
+    evaluation matches predictions to ground truth by overlap, not by index, so
+    a blank row would register as a spurious empty segment.
+
+    Args:
+        path: Output CSV path.
+        predictions: Iterable of ``(image_name_or_id, label_map)``.
+        expected_shape: Frame size the challenge assumes. A mismatch is raised
+            rather than written, because the size is omitted from the encoding
+            and a wrong one would decode into nonsense on the organisers' side.
+
+    Returns:
+        The number of filament rows written.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = 0
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(CHALLENGE_COLUMNS)
+        for name, labels in predictions:
+            labels = np.asarray(labels)
+            if labels.shape != tuple(expected_shape):
+                raise ValueError(
+                    f"{name}: mask is {labels.shape}, but the challenge fixes the "
+                    f"frame at {tuple(expected_shape)} and the submission omits the "
+                    f"size, so this would decode incorrectly."
+                )
+            image_id = image_id_from_name(name)
+            for number, value in enumerate(
+                (v for v in np.unique(labels) if v > 0), start=1
+            ):
+                writer.writerow(
+                    [f"{image_id}_{number}", coco_rle_counts(labels == value)]
+                )
+                rows += 1
+    return rows
+
+
+def read_challenge_csv(
+    path: str | Path, shape: tuple[int, int] = (2048, 2048)
+) -> dict[str, list[np.ndarray]]:
+    """Read a submission back into masks per image, for checking it.
+
+    Returns:
+        A mapping from image id to the list of predicted masks.
+    """
+    out: dict[str, list[np.ndarray]] = {}
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            filament_id = row[CHALLENGE_COLUMNS[0]]
+            image_id = filament_id.rsplit("_", 1)[0]
+            mask = decode_coco_rle_counts(row[CHALLENGE_COLUMNS[1]], *shape)
+            out.setdefault(image_id, []).append(mask)
+    return out

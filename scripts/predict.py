@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Segment filaments in a directory of full-disk images and write a submission.
 
-Works either from a trained checkpoint or, with ``--classical``, from the
-training-free detector::
+Writes the competition's CSV by default -- one row per predicted filament, keyed
+``<image_id>_<n>``, with the mask as pycocotools RLE counts::
 
-    python scripts/predict.py --images data/test --checkpoint runs/filanet/best.pt \
-        --out submission.json --format coco
+    python scripts/predict.py --images data/test \
+        --checkpoint runs/filanet/best.pt --out submission.csv
 
-    python scripts/predict.py --images data/test --classical --out submission.csv --format csv
+Use ``--classical`` in place of ``--checkpoint`` for the training-free detector,
+and ``--format coco`` or ``--format png`` for the other writers.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from filaseg.inference import InferenceConfig, predict
 from filaseg.postprocess.instances import InstanceConfig
 from filaseg.submission import (
     summarise_predictions,
+    write_challenge_csv,
     write_coco,
     write_label_pngs,
     write_rle_csv,
@@ -47,7 +49,11 @@ def main() -> None:
     parser.add_argument("--classical", action="store_true",
                         help="use the training-free detector instead of a network")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--format", choices=("coco", "csv", "png"), default="coco")
+    parser.add_argument("--format",
+                        choices=("challenge", "coco", "csv", "png"),
+                        default="challenge",
+                        help="'challenge' writes the competition CSV: one row per "
+                             "filament, pycocotools RLE counts (the default)")
     parser.add_argument("--threshold", type=float,
                         help="override the threshold stored in the checkpoint")
     parser.add_argument("--tile-size", type=int, default=512, dest="tile_size")
@@ -101,7 +107,12 @@ def main() -> None:
         if index % 10 == 0 or index == len(paths):
             print(f"  {index}/{len(paths)}  ({time.time() - started:.0f}s)", flush=True)
 
-    if args.format == "coco":
+    if args.format == "challenge":
+        count = write_challenge_csv(
+            args.out, [(name, labels) for name, labels, _ in records]
+        )
+        print(f"wrote {count} filament rows to {args.out}")
+    elif args.format == "coco":
         # The image id is the file stem, which is what the annotations use.
         # MAGFiLO keys observations by the original GONG frame name, so deriving
         # an integer from it would produce ids the grader cannot match.

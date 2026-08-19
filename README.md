@@ -118,11 +118,17 @@ python scripts/train.py --config configs/default.yaml --data-dir data \
 # Score on the held-out split
 python scripts/evaluate.py --data-dir data --checkpoint runs/filanet/best.pt
 
-# Predict on test/ and write a submission
+# Predict on test/ and write the competition submission
 python scripts/predict.py --images data/test \
-    --checkpoint runs/filanet/best.pt \
-    --out submission.json --format coco
+    --checkpoint runs/filanet/best.pt --out submission.csv
 ```
+
+The default output is the competition's format: one row per predicted filament,
+keyed `<image_id>_<n>`, with the mask as pycocotools RLE counts and the size
+omitted (every frame is 2048×2048). Images with no detection contribute no rows,
+which is right — the grader matches by overlap, so a blank row would count as a
+spurious segment. `read_challenge_csv()` decodes a submission back to masks if
+you want to check one before uploading.
 
 `--data-dir` finds the annotation JSON, the training images and the test images
 by itself, whatever the JSON is called. Pass `--annotations` and `--image-dir`
@@ -150,9 +156,12 @@ Two practical notes:
 - Frames may sit directly in the split directory or nested inside it; both are
   found, matching stems exactly so a record whose image was never distributed
   comes back missing rather than latching on to a similar name.
-- Records whose image is not in the split are skipped with a count, and several
-  records describing the *same* frame are merged, since keeping them apart would
-  present one record's filaments as background in another's.
+- Records whose image is not in the split are skipped with a count. Several
+  records describing the *same* frame are **kept separate**: in MAGFiLO these
+  are independent complete readings by different annotators, which the challenge
+  says to treat as different images, so they serve as extra training examples
+  that expose the model to genuine annotator disagreement. Train/validation
+  splits are grouped by frame, so one image can never appear on both sides.
 - Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
   observations by the original GONG frame name (`040301-20140609195854Bh`)
   rather than an integer, and submissions carry those names back unchanged.
@@ -436,7 +445,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-167 tests cover geometry, photometry, annotation parsing and encoding, the loss
+175 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

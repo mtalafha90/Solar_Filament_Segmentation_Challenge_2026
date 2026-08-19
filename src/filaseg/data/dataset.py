@@ -163,6 +163,7 @@ class MagfiloDataset:
         image_ids: Sequence[ImageId] | None = None,
         require_images: bool = True,
         search_subdirectories: bool = True,
+        merge_duplicate_frames: bool = False,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.search_subdirectories = bool(search_subdirectories)
@@ -216,17 +217,52 @@ class MagfiloDataset:
                 )
                 records = [r for r in records if r.file_name in self.resolved]
 
-            records = self._merge_duplicate_frames(records)
+            if merge_duplicate_frames:
+                records = self._merge_duplicate_frames(records)
+            else:
+                self._count_repeated_frames(records)
 
         self.records = records
+
+    def _count_repeated_frames(self, records: list[ImageRecord]) -> None:
+        """Note how many frames carry more than one independent annotation.
+
+        MAGFiLO has several annotators label the same observation independently,
+        and the image ids encode which: ``010401-20160920230134Lh`` and
+        ``010402-20160920230134Lh`` are two people's readings of one frame. The
+        organisers state these are to be treated as separate images, and that is
+        what we do -- each is a complete annotation in its own right, not a part
+        of one. Treating them as extra training examples exposes the model to
+        genuine annotator disagreement, which is a fair reflection of how
+        ambiguous a faint filament's extent really is.
+
+        They must not be split across training and validation, though, or the
+        model validates on an image it trained on. :func:`group_key` gives the
+        grouping that prevents that.
+        """
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.file_name] = counts.get(record.file_name, 0) + 1
+        self.merged = 0
+        self.repeated = sum(count - 1 for count in counts.values() if count > 1)
+        if self.repeated:
+            warnings.warn(
+                f"{self.repeated} of {len(records)} records annotate a frame that "
+                f"another record also annotates, by a different annotator. They are "
+                f"kept as separate observations, which is what the challenge "
+                f"specifies; {len(counts)} distinct images are covered. Splits are "
+                f"grouped by image so the same frame cannot appear in both training "
+                f"and validation.",
+                stacklevel=3,
+            )
 
     def _merge_duplicate_frames(self, records: list[ImageRecord]) -> list[ImageRecord]:
         """Fold records that describe the same frame into one.
 
-        MAGFiLO lists some observations more than once, each entry carrying part
-        of that frame's filaments. Kept apart, every entry would present the
-        other entries' filaments as background, teaching the model that real
-        filaments are quiet Sun. Their annotations are therefore combined.
+        Off by default. Only correct if repeated records hold *parts* of one
+        frame's annotation; in MAGFiLO they are independent complete readings by
+        different annotators, so merging them would union overlapping masks of
+        the same filaments and inflate the filament count.
         """
         by_file: OrderedDict[str, ImageRecord] = OrderedDict()
         duplicates = 0
@@ -258,6 +294,15 @@ class MagfiloDataset:
     @property
     def image_ids(self) -> list[ImageId]:
         return [record.image_id for record in self.records]
+
+    @property
+    def group_keys(self) -> list[str]:
+        """The underlying frame each record annotates.
+
+        Records sharing a key are different annotators' readings of one image,
+        so they must land on the same side of a train/validation split.
+        """
+        return [record.file_name for record in self.records]
 
     def _cache_path(self, record: ImageRecord) -> Path | None:
         """Cache file for one observation.

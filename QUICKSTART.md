@@ -171,12 +171,14 @@ of Dice, IoU and PQ across observations, and the seconds per frame.
 python scripts/predict.py \
     --images data/test \
     --checkpoint runs/filanet/best.pt \
-    --out submission.json --format coco
+    --out submission.csv
 ```
 
-Use `--format csv` for run-length encoded rows instead, and `--format png` for
-label-map images. Swap `--checkpoint runs/filanet/best.pt` for `--classical` to
-submit the training-free detector's output.
+This writes the competition's format by default: `filament_id,segmentation_rle`,
+one row per filament, ids like `20150125172714Mh_1`, masks as pycocotools RLE
+counts with the size omitted. `--format coco` and `--format png` are also
+available. Swap `--checkpoint` for `--classical` to submit the training-free
+detector's output.
 
 Check the printed **submission summary** before uploading: if the filaments per
 image or the pixel coverage look nothing like the training statistics that

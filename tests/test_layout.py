@@ -457,13 +457,17 @@ def _duplicate_frame_dataset(tmp_path):
     return path, train
 
 
-def test_records_describing_one_frame_are_merged(tmp_path):
-    """Kept apart, each record would present the other's filaments as background."""
+def test_records_describing_one_frame_can_be_merged(tmp_path):
+    """Merging remains available for datasets whose records really are partial.
+
+    It is off by default because MAGFiLO's repeated records are independent
+    complete readings by different annotators, not parts of one annotation.
+    """
     annotations, train = _duplicate_frame_dataset(tmp_path)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        dataset = MagfiloDataset(annotations, train)
+        dataset = MagfiloDataset(annotations, train, merge_duplicate_frames=True)
 
     assert len(dataset) == 1
     assert len(dataset.records[0].annotations) == 2   # both halves kept
@@ -483,7 +487,7 @@ def test_merged_records_keep_their_chirality(tmp_path):
     annotations, train = _duplicate_frame_dataset(tmp_path)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        dataset = MagfiloDataset(annotations, train)
+        dataset = MagfiloDataset(annotations, train, merge_duplicate_frames=True)
     chirality = sorted(a.chirality for a in dataset.records[0].annotations)
     assert chirality == [1, 2]
 
@@ -502,3 +506,148 @@ def test_dataset_reports_zero_observations_rather_than_guessing(tmp_path):
     with pytest.warns(UserWarning, match="have no image"):
         dataset = MagfiloDataset(path, train)
     assert len(dataset) == 0
+
+
+# ---------------------------------------------------------------------------
+# The challenge submission format, and independent annotator records
+# ---------------------------------------------------------------------------
+
+
+def test_challenge_rle_round_trips_losslessly():
+    pytest.importorskip("pycocotools")
+    from filaseg.submission import coco_rle_counts, decode_coco_rle_counts
+
+    rng = np.random.default_rng(0)
+    mask = np.zeros((2048, 2048), dtype=bool)
+    mask[100:140, 200:600] = True
+    mask[120:200, 600:640] = True          # a barb
+    mask[rng.integers(0, 2048, 50), rng.integers(0, 2048, 50)] = True
+
+    counts = coco_rle_counts(mask)
+    assert np.array_equal(decode_coco_rle_counts(counts), mask)
+    # The payload must survive a plain CSV without escaping.
+    assert '"' not in counts and "," not in counts and "\n" not in counts
+
+
+def test_challenge_csv_has_the_required_shape(tmp_path):
+    pytest.importorskip("pycocotools")
+    from filaseg.submission import read_challenge_csv, write_challenge_csv
+
+    labels = np.zeros((2048, 2048), dtype=np.int32)
+    labels[100:140, 200:600] = 1
+    labels[900:930, 1000:1500] = 2
+
+    rows = write_challenge_csv(
+        tmp_path / "submission.csv",
+        [
+            ("20150125172714Mh.jpeg", labels),
+            ("20170501024112Bh.jpeg", np.zeros((2048, 2048), dtype=np.int32)),
+        ],
+    )
+    assert rows == 2
+
+    text = (tmp_path / "submission.csv").read_text().splitlines()
+    assert text[0] == "filament_id,segmentation_rle"
+    assert text[1].startswith("20150125172714Mh_1,")
+    assert text[2].startswith("20150125172714Mh_2,")
+    # An image with no detections contributes no rows: the grader matches by
+    # overlap, so an empty row would count as a spurious segment.
+    assert not any(line.startswith("20170501024112Bh") for line in text)
+
+    recovered = read_challenge_csv(tmp_path / "submission.csv")
+    assert set(recovered) == {"20150125172714Mh"}
+    assert np.array_equal(recovered["20150125172714Mh"][0], labels == 1)
+
+
+def test_challenge_csv_refuses_the_wrong_frame_size(tmp_path):
+    pytest.importorskip("pycocotools")
+    from filaseg.submission import write_challenge_csv
+
+    with pytest.raises(ValueError, match="2048"):
+        write_challenge_csv(
+            tmp_path / "bad.csv", [("x.jpeg", np.zeros((512, 512), dtype=np.int32))]
+        )
+
+
+def test_image_id_strips_the_annotator_prefix():
+    from filaseg.submission import image_id_from_name
+
+    assert image_id_from_name("20260901165702Bh.jpeg") == "20260901165702Bh"
+    assert image_id_from_name("010401-20160920230134Lh.jpeg") == "20160920230134Lh"
+    assert image_id_from_name("some/dir/20150125172714Mh.jpeg") == "20150125172714Mh"
+    # A hyphen that is not an annotator batch must be left alone.
+    assert image_id_from_name("odd-name.jpeg") == "odd-name"
+
+
+def _two_annotator_dataset(tmp_path):
+    """One frame, annotated independently by two people, as MAGFiLO does."""
+    from PIL import Image
+
+    train = tmp_path / "train"
+    train.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(
+        np.random.default_rng(0).integers(0, 255, (96, 96), dtype=np.uint8)
+    ).save(train / "20160920230134Lh.jpeg")
+
+    coco = {
+        "info": {}, "licenses": [], "categories": [{"id": 1, "name": "Left"}],
+        "images": [
+            {"id": f"01040{n}-20160920230134Lh",
+             "file_name": "20160920230134Lh.jpeg", "height": 96, "width": 96}
+            for n in (1, 2)
+        ],
+        "annotations": [
+            {"id": f"ann{n}", "image_id": f"01040{n}-20160920230134Lh",
+             "category_id": 1, "bbox": [30, 30, 20, 20],
+             "segmentation": [[30, 30, 50, 30, 50, 50, 30, 50]], "area": 400}
+            for n in (1, 2)
+        ],
+    }
+    path = train / "ann.json"
+    path.write_text(json.dumps(coco))
+    return path, train
+
+
+def test_independent_annotations_are_kept_separate(tmp_path):
+    """The organisers say to treat these as different images, so we do."""
+    annotations, train = _two_annotator_dataset(tmp_path)
+
+    with pytest.warns(UserWarning, match="different annotator"):
+        dataset = MagfiloDataset(annotations, train)
+
+    assert len(dataset) == 2            # not merged into one
+    assert dataset.merged == 0
+    assert dataset.repeated == 1
+    # Each keeps its own annotator's reading, one filament each.
+    assert all(len(r.annotations) == 1 for r in dataset.records)
+
+
+def test_merging_is_available_but_off_by_default(tmp_path):
+    annotations, train = _two_annotator_dataset(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        merged = MagfiloDataset(annotations, train, merge_duplicate_frames=True)
+    assert len(merged) == 1
+    assert len(merged.records[0].annotations) == 2
+
+
+def test_split_keeps_one_frame_out_of_both_sides(tmp_path):
+    """Otherwise the model validates on an image it trained on."""
+    from filaseg.train import split_ids
+
+    groups = ["a.jpg", "a.jpg", "b.jpg", "c.jpg", "c.jpg", "c.jpg", "d.jpg", "e.jpg"]
+    train_idx, val_idx = split_ids(len(groups), 0.3, seed=0, groups=groups)
+
+    assert sorted(train_idx + val_idx) == list(range(len(groups)))
+    train_groups = {groups[i] for i in train_idx}
+    val_groups = {groups[i] for i in val_idx}
+    assert not (train_groups & val_groups)
+    assert val_groups                      # the split is not degenerate
+
+
+def test_split_without_groups_is_unchanged():
+    from filaseg.train import split_ids
+
+    train_idx, val_idx = split_ids(20, 0.15, seed=0)
+    assert len(train_idx) + len(val_idx) == 20
+    assert not set(train_idx) & set(val_idx)

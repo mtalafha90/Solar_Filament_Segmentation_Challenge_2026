@@ -6,6 +6,7 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass, field, replace
+from typing import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -79,13 +80,50 @@ class TrainConfig:
 
 
 def split_ids(
-    n_images: int, val_fraction: float, seed: int
+    n_images: int,
+    val_fraction: float,
+    seed: int,
+    groups: Sequence[str] | None = None,
 ) -> tuple[list[int], list[int]]:
-    """Split indices into training and validation sets, deterministically."""
+    """Split indices into training and validation sets, deterministically.
+
+    When ``groups`` is given, indices sharing a group value are kept together.
+    This matters for MAGFiLO: several annotators label the same observation
+    independently, and those records must not straddle the split, or the model
+    is validated on an image it was trained on and every score is optimistic.
+
+    Args:
+        n_images: Number of observations.
+        val_fraction: Share to hold out.
+        seed: Seed, for a reproducible split.
+        groups: Optional group label per observation, usually the file name.
+
+    Returns:
+        ``(train_indices, val_indices)``.
+    """
     rng = np.random.default_rng(seed)
-    order = rng.permutation(n_images)
-    n_val = max(1, int(round(n_images * val_fraction))) if n_images > 1 else 0
-    return sorted(order[n_val:].tolist()), sorted(order[:n_val].tolist())
+    if groups is None:
+        order = rng.permutation(n_images)
+        n_val = max(1, int(round(n_images * val_fraction))) if n_images > 1 else 0
+        return sorted(order[n_val:].tolist()), sorted(order[:n_val].tolist())
+
+    if len(groups) != n_images:
+        raise ValueError("groups must have one entry per observation")
+
+    members: dict[str, list[int]] = {}
+    for index, key in enumerate(groups):
+        members.setdefault(str(key), []).append(index)
+
+    keys = sorted(members)
+    shuffled = rng.permutation(len(keys))
+    n_val_groups = (
+        max(1, int(round(len(keys) * val_fraction))) if len(keys) > 1 else 0
+    )
+    val_keys = {keys[i] for i in shuffled[:n_val_groups]}
+
+    train_indices = [i for key in keys if key not in val_keys for i in members[key]]
+    val_indices = [i for key in keys if key in val_keys for i in members[key]]
+    return sorted(train_indices), sorted(val_indices)
 
 
 def build_scheduler(
@@ -242,7 +280,9 @@ def train(config: TrainConfig) -> dict[str, float]:
     source = MagfiloDataset(config.annotations, config.image_dir, config.cache_dir)
     if len(source) == 0:
         raise ValueError("the dataset is empty; check --annotations and --image-dir")
-    train_indices, val_indices = split_ids(len(source), config.val_fraction, config.seed)
+    train_indices, val_indices = split_ids(
+        len(source), config.val_fraction, config.seed, groups=source.group_keys
+    )
 
     train_source = MagfiloDataset(
         config.annotations,

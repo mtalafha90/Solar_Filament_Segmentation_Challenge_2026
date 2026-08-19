@@ -111,9 +111,12 @@ def main() -> None:
         print(f"    ... and {len(missing) - 3} more")
 
     if len(records) > len(distinct_names):
-        print(f"\n  {len(records) - len(distinct_names)} record(s) repeat a frame "
-              f"already listed. Their filaments are")
-        print("  merged on load, so no filament is presented as background.")
+        repeats = len(records) - len(distinct_names)
+        print(f"\n  {repeats} record(s) annotate a frame that another record also")
+        print("  annotates -- MAGFiLO has several annotators label the same")
+        print("  observation independently. They are kept as separate training")
+        print("  examples, which is what the challenge specifies, and splits are")
+        print("  grouped by frame so one image cannot appear on both sides.")
 
     if missing and resolved:
         print("\n  Records with no image are normal: the annotation file covers")

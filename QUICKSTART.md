@@ -112,6 +112,16 @@ python scripts/train.py --config configs/default.yaml \
     --epochs 60
 ```
 
+Use the `pos_weight` and `patch_size` that `inspect_data.py` printed for **your**
+data — both matter a great deal. Either edit `configs/default.yaml` or pass them
+directly:
+
+```bash
+python scripts/train.py --config configs/default.yaml --data-dir data \
+    --cache-dir data/cache --output-dir runs/filanet \
+    --epochs 60 --patch-size 512 --pos-weight 11.6 --batch-size 4
+```
+
 Notes:
 
 - The **first epoch is slow** — every frame is preprocessed and cached to

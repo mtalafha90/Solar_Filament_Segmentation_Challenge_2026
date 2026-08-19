@@ -121,6 +121,11 @@ python scripts/predict.py --images data/test \
 by itself, whatever the JSON is called. Pass `--annotations` and `--image-dir`
 instead if your layout is unusual.
 
+Run `inspect_data.py` first and use the `pos_weight` and `patch_size` it reports
+for your data: both are set from the class imbalance and the solar radius, and
+the defaults will not suit a dataset with different statistics. They can be
+passed straight through, e.g. `--patch-size 512 --pos-weight 11.6`.
+
 Swap `--checkpoint …` for `--classical` anywhere above to use the training-free
 detector, which needs no weights and runs in a couple of seconds per frame.
 

@@ -3,12 +3,14 @@
 
 Example::
 
-    python scripts/train.py \
-        --annotations data/magfilo/annotations.json \
-        --image-dir data/magfilo/images \
+    python scripts/train.py --config configs/default.yaml \
+        --data-dir data \
         --cache-dir data/cache \
         --output-dir runs/filanet \
-        --epochs 60 --patch-size 256 --batch-size 8
+        --epochs 60
+
+Run scripts/inspect_data.py first: it reports the patch size and positive-class
+weight that suit your data, and both matter a great deal here.
 """
 
 from __future__ import annotations
@@ -72,6 +74,15 @@ def main() -> None:
     parser.add_argument("--samples-per-epoch", type=int, dest="samples_per_epoch")
     parser.add_argument("--learning-rate", type=float, dest="learning_rate")
     parser.add_argument("--val-fraction", type=float, dest="val_fraction")
+    parser.add_argument("--pos-weight", type=float, dest="pos_weight",
+                        help="positive-class weight; raise it when filaments are "
+                             "rare (scripts/inspect_data.py suggests a value)")
+    parser.add_argument("--positive-fraction", type=float, dest="positive_fraction",
+                        help="share of crops centred on a filament (default 0.7)")
+    parser.add_argument("--val-tile", type=int, dest="val_tile",
+                        help="tile size used when validating on whole disks")
+    parser.add_argument("--warmup-epochs", type=int, dest="warmup_epochs")
+    parser.add_argument("--weight-decay", type=float, dest="weight_decay")
     parser.add_argument("--num-workers", type=int, dest="num_workers")
     parser.add_argument("--device", type=str)
     parser.add_argument("--seed", type=int)

@@ -317,10 +317,36 @@ learns the background texture, neither of which a per-pixel score can do.
 
 ## Metrics
 
-`filaseg.metrics` implements everything the challenge scores — pixel IoU,
-precision, recall, `AP@IoU` at several thresholds, hit rate, miss rate,
-pairwise IoU and multi-scale IoU (MSIoU) — plus clDice as a direct read-out of
-whether fine structure survived.
+The challenge ranks on **Panoptic Quality** and the **mean Dice score**, and
+additionally assesses fragmentation, over-merging and end-to-end speed.
+`filaseg.metrics` implements all of it.
+
+Panoptic Quality is the one that shapes the design:
+
+```
+PQ = sum of IoU over matched pairs / (|TP| + 0.5|FP| + 0.5|FN|)
+```
+
+It is unforgiving in exactly the way this task needs. Splitting one filament in
+two gives a match and a false positive; merging two gives a match and a false
+negative. Both cost as much as missing a filament outright, so a prediction can
+score well on pixel overlap and badly here — which is why threshold calibration
+and checkpoint selection both optimise PQ by default, not IoU. `fragmentation()`
+then separates the two failures, since PQ punishes both without saying which
+occurred:
+
+| Prediction | PQ | SQ | RQ | Flagged as |
+|---|---|---|---|---|
+| Exact | 1.000 | 1.000 | 1.000 | — |
+| One filament missed | 0.800 | 1.000 | 0.800 | missed |
+| One spurious extra | 0.857 | 1.000 | 0.857 | spurious |
+| One filament split in two | 0.571 | 1.000 | 0.571 | one-to-many |
+| Two filaments merged | 0.400 | 1.000 | 0.400 | many-to-one |
+| Every mask shifted 2 px | 0.667 | 0.667 | 1.000 | — |
+
+Also implemented: pixel IoU, precision, recall, `AP@IoU` at several thresholds,
+hit and miss rates, pairwise IoU, multi-scale IoU (MSIoU), and clDice as a
+direct read-out of whether fine structure survived.
 
 **MSIoU** exists because plain IoU judges thin structures poorly: a filament
 three pixels wide predicted one pixel to the left scores near zero despite
@@ -410,7 +436,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-157 tests cover geometry, photometry, annotation parsing and encoding, the loss
+167 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

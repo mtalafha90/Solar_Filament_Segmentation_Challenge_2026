@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Score predictions against ground-truth annotations.
 
-Reports every metric the challenge uses: pixel IoU, precision, recall, clDice,
-multi-scale IoU, hit and miss rates, and AP at several IoU thresholds.
+Reports what the challenge ranks on -- Panoptic Quality and the mean Dice score
+-- alongside the fragmentation and over-merging counts it penalises, the pixel
+metrics, and the end-to-end time per frame, which is also assessed.
 
 Example::
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import _bootstrap  # noqa: F401
@@ -84,6 +86,7 @@ def main() -> None:
     instance_config = InstanceConfig(threshold=threshold, min_area=args.min_area)
 
     per_image: list[dict] = []
+    started = time.time()
     for position, index in enumerate(indices, start=1):
         prepared = dataset[index]
         if args.classical:
@@ -101,17 +104,45 @@ def main() -> None:
         if position % 10 == 0 or position == len(list(indices)):
             print(f"  {position} done", flush=True)
 
+    elapsed = time.time() - started
     summary = aggregate([{k: v for k, v in r.items() if k != "image_id"} for r in per_image])
+    summary["seconds_per_image"] = elapsed / max(len(per_image), 1)
+
+    groups = [
+        ("RANKED ON", ["pq", "dice"]),
+        ("PANOPTIC BREAKDOWN", ["sq", "rq", "pq_tp", "pq_fp", "pq_fn"]),
+        ("FRAGMENTATION AND OVER-MERGING",
+         ["one_to_one", "one_to_many", "many_to_one", "missed", "spurious",
+          "fragments_per_split"]),
+        ("PIXEL OVERLAP",
+         ["iou", "precision", "recall", "f1", "cl_dice", "msiou"]),
+        ("DETECTION",
+         ["hit_rate", "miss_rate", "false_discovery_rate", "mean_pairwise_iou",
+          "AP@0.25", "AP@0.50", "AP@0.75", "mAP"]),
+        ("COUNTS", ["n_predicted", "n_truth", "n_matched", "n_images"]),
+        ("EFFICIENCY", ["seconds_per_image"]),
+    ]
     print("\n" + "=" * 58)
     print("RESULTS")
     print("=" * 58)
-    order = ["iou", "dice", "precision", "recall", "f1", "cl_dice", "msiou",
-             "hit_rate", "miss_rate", "false_discovery_rate", "mean_pairwise_iou",
-             "AP@0.25", "AP@0.50", "AP@0.75", "mAP",
-             "n_predicted", "n_truth", "n_matched", "n_images"]
-    for key in order:
-        if key in summary:
-            print(f"  {key:22s} {summary[key]:.4f}")
+    for title, keys in groups:
+        present = [k for k in keys if k in summary]
+        if not present:
+            continue
+        print(f"\n  {title}")
+        for key in present:
+            print(f"    {key:24s} {summary[key]:.4f}")
+
+    # Distributions, which the challenge asks for explicitly.
+    if per_image:
+        print("\n  DISTRIBUTIONS across observations")
+        for key in ("dice", "iou", "pq"):
+            values = np.array([r[key] for r in per_image if key in r])
+            if values.size:
+                quartiles = np.percentile(values, [25, 50, 75])
+                print(f"    {key:8s} min {values.min():.3f}  "
+                      f"q1 {quartiles[0]:.3f}  median {quartiles[1]:.3f}  "
+                      f"q3 {quartiles[2]:.3f}  max {values.max():.3f}")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -442,6 +442,10 @@ def evaluate(
             predictions, truths, match_threshold, ap_thresholds, areas
         ).as_dict()
     )
+    # The challenge ranks on Panoptic Quality and reports the fragmentation and
+    # over-merging behind it, so both are always computed.
+    results.update(panoptic_quality(predictions, truths, match_threshold).as_dict())
+    results.update(fragmentation(predictions, truths).as_dict())
     return results
 
 
@@ -454,7 +458,9 @@ def aggregate(per_image: list[dict[str, float]]) -> dict[str, float]:
     if not per_image:
         return {}
     summed = {"true_positive", "false_positive", "false_negative",
-              "n_predicted", "n_truth", "n_matched"}
+              "n_predicted", "n_truth", "n_matched",
+              "pq_tp", "pq_fp", "pq_fn",
+              "one_to_one", "one_to_many", "many_to_one", "missed", "spurious"}
     keys = sorted({key for record in per_image for key in record})
     out: dict[str, float] = {}
     for key in keys:
@@ -464,3 +470,189 @@ def aggregate(per_image: list[dict[str, float]]) -> dict[str, float]:
         out[key] = float(np.sum(values)) if key in summed else float(np.mean(values))
     out["n_images"] = float(len(per_image))
     return out
+
+
+# --------------------------------------------------------------------------
+# Panoptic Quality, and the fragmentation it is meant to expose
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PanopticScores:
+    """Panoptic Quality and its two factors, for one observation."""
+
+    pq: float
+    """Panoptic Quality: segmentation quality times recognition quality."""
+    sq: float
+    """Segmentation Quality: mean IoU over matched pairs."""
+    rq: float
+    """Recognition Quality: the F1 of the matching itself."""
+    true_positive: int
+    false_positive: int
+    false_negative: int
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "pq": self.pq,
+            "sq": self.sq,
+            "rq": self.rq,
+            "pq_tp": self.true_positive,
+            "pq_fp": self.false_positive,
+            "pq_fn": self.false_negative,
+        }
+
+
+def panoptic_quality(
+    predictions: list[np.ndarray],
+    truths: list[np.ndarray],
+    threshold: float = 0.5,
+) -> PanopticScores:
+    """Panoptic Quality, as defined by Kirillov et al. (CVPR 2019).
+
+    .. math::
+
+        PQ = \\frac{\\sum_{(y, \\hat{y}) \\in TP} IoU(y, \\hat{y})}
+                  {|TP| + \\tfrac{1}{2}|FP| + \\tfrac{1}{2}|FN|}
+
+    A predicted segment and a ground-truth segment match when their IoU exceeds
+    ``threshold``. At the standard 0.5 that matching is provably unique -- no
+    segment can overlap two others by more than half -- so no tie-breaking is
+    needed and the result does not depend on the order segments are considered
+    in.
+
+    PQ is unforgiving in exactly the way this task needs. Splitting one filament
+    into two predictions yields one match and one false positive; merging two
+    filaments into one yields one match and one false negative. Both cost the
+    same as missing a filament outright, which is why a segmentation can score
+    well on pixel IoU and badly here.
+
+    Args:
+        predictions: One boolean mask per predicted filament.
+        truths: One boolean mask per annotated filament.
+        threshold: IoU above which a pair counts as matched.
+
+    Returns:
+        The :class:`PanopticScores` for this observation.
+    """
+    if not predictions and not truths:
+        return PanopticScores(1.0, 1.0, 1.0, 0, 0, 0)
+    if not predictions or not truths:
+        return PanopticScores(
+            0.0, 0.0, 0.0, 0, len(predictions), len(truths)
+        )
+
+    iou = pairwise_iou_matrix(predictions, truths)
+    matched_pred, matched_true = np.nonzero(iou > threshold)
+    matched_iou = iou[matched_pred, matched_true]
+
+    true_positive = int(matched_iou.size)
+    false_positive = len(predictions) - true_positive
+    false_negative = len(truths) - true_positive
+
+    denominator = true_positive + 0.5 * false_positive + 0.5 * false_negative
+    pq = float(matched_iou.sum() / denominator) if denominator > 0 else 0.0
+    sq = float(matched_iou.mean()) if true_positive else 0.0
+    rq = float(true_positive / denominator) if denominator > 0 else 0.0
+    return PanopticScores(pq, sq, rq, true_positive, false_positive, false_negative)
+
+
+@dataclass
+class FragmentationScores:
+    """How prediction and truth segments correspond, beyond one-to-one."""
+
+    one_to_one: int
+    one_to_many: int
+    """Ground-truth filaments broken across several predictions (fragmentation)."""
+    many_to_one: int
+    """Predictions covering several ground-truth filaments (over-merging)."""
+    missed: int
+    spurious: int
+    fragments_per_split: float
+    """Mean number of predictions covering a fragmented filament."""
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "one_to_one": self.one_to_one,
+            "one_to_many": self.one_to_many,
+            "many_to_one": self.many_to_one,
+            "missed": self.missed,
+            "spurious": self.spurious,
+            "fragments_per_split": self.fragments_per_split,
+        }
+
+
+def fragmentation(
+    predictions: list[np.ndarray],
+    truths: list[np.ndarray],
+    overlap: float = 0.1,
+) -> FragmentationScores:
+    """Count how often filaments are split apart or welded together.
+
+    Panoptic Quality punishes both faults but does not say which occurred. This
+    separates them, which is what tells you whether to merge more aggressively
+    or less.
+
+    A prediction and a truth are taken to correspond when they overlap by more
+    than ``overlap`` of the smaller of the two. That is deliberately looser than
+    the matching threshold: a filament split into three pieces has no piece
+    reaching IoU 0.5, and the point here is to notice precisely that.
+
+    Args:
+        predictions: One boolean mask per predicted filament.
+        truths: One boolean mask per annotated filament.
+        overlap: Fraction of the smaller segment that must overlap.
+
+    Returns:
+        The :class:`FragmentationScores` for this observation.
+    """
+    if not truths:
+        return FragmentationScores(0, 0, 0, 0, len(predictions), 0.0)
+    if not predictions:
+        return FragmentationScores(0, 0, 0, len(truths), 0, 0.0)
+
+    shape = truths[0].shape
+    pred_labels = np.zeros(shape, dtype=np.int32)
+    for index, mask in enumerate(predictions, start=1):
+        pred_labels[mask] = index
+    true_labels = np.zeros(shape, dtype=np.int32)
+    for index, mask in enumerate(truths, start=1):
+        true_labels[mask] = index
+
+    n_pred, n_true = len(predictions), len(truths)
+    combined = pred_labels.astype(np.int64) * (n_true + 1) + true_labels.astype(np.int64)
+    table = np.bincount(
+        combined.ravel(), minlength=(n_pred + 1) * (n_true + 1)
+    ).reshape(n_pred + 1, n_true + 1).astype(np.float64)
+
+    intersection = table[1:, 1:]
+    pred_area = table[1:, :].sum(axis=1, keepdims=True)
+    true_area = table[:, 1:].sum(axis=0, keepdims=True)
+    smaller = np.minimum(pred_area, true_area)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = np.where(smaller > 0, intersection / smaller, 0.0)
+    linked = share > overlap
+
+    per_truth = linked.sum(axis=0)      # predictions touching each true filament
+    per_pred = linked.sum(axis=1)       # true filaments touched by each prediction
+
+    missed = int((per_truth == 0).sum())
+    spurious = int((per_pred == 0).sum())
+    one_to_many = int((per_truth > 1).sum())
+    many_to_one = int((per_pred > 1).sum())
+    # A clean one-to-one correspondence: the truth is touched by exactly one
+    # prediction, and that prediction touches exactly this truth and no other.
+    single = per_truth == 1
+    if single.any():
+        partner = np.asarray(linked[:, single]).argmax(axis=0)
+        one_to_one = int((per_pred[partner] == 1).sum())
+    else:
+        one_to_one = 0
+    split_counts = per_truth[per_truth > 1]
+    return FragmentationScores(
+        one_to_one=one_to_one,
+        one_to_many=one_to_many,
+        many_to_one=many_to_one,
+        missed=missed,
+        spurious=spurious,
+        fragments_per_split=float(split_counts.mean()) if split_counts.size else 0.0,
+    )

@@ -161,8 +161,9 @@ python scripts/evaluate.py \
     --out runs/filanet/scores.json
 ```
 
-Prints IoU, precision, recall, clDice, multi-scale IoU, hit and miss rates and
-AP at three IoU thresholds.
+Leads with what the challenge ranks on — Panoptic Quality and mean Dice — then
+the fragmentation and over-merging counts, the pixel metrics, the distributions
+of Dice, IoU and PQ across observations, and the seconds per frame.
 
 ## 8. Predict on the test set and write a submission
 

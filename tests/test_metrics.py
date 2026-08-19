@@ -183,3 +183,135 @@ def test_aggregate_sums_counts_and_averages_rates():
 
 def test_aggregate_of_nothing_is_empty():
     assert aggregate([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Panoptic Quality: the challenge's ranking metric
+# ---------------------------------------------------------------------------
+
+
+def _segments(*boxes, shape=(128, 128)):
+    out = []
+    for y0, y1, x0, x1 in boxes:
+        mask = np.zeros(shape, dtype=bool)
+        mask[y0:y1, x0:x1] = True
+        out.append(mask)
+    return out
+
+
+TRUTH = _segments((10, 20, 10, 90), (40, 50, 10, 90), (70, 80, 10, 90))
+
+
+def test_panoptic_quality_is_one_for_a_perfect_prediction():
+    from filaseg.metrics import panoptic_quality
+
+    scores = panoptic_quality(TRUTH, TRUTH)
+    assert scores.pq == pytest.approx(1.0)
+    assert scores.sq == pytest.approx(1.0)
+    assert scores.rq == pytest.approx(1.0)
+    assert (scores.true_positive, scores.false_positive, scores.false_negative) == (3, 0, 0)
+
+
+def test_panoptic_quality_matches_the_published_formula():
+    """PQ = sum(IoU over TP) / (|TP| + 0.5|FP| + 0.5|FN|)."""
+    from filaseg.metrics import panoptic_quality
+
+    # Two of three found exactly, one missed: 2 / (2 + 0 + 0.5) = 0.8
+    scores = panoptic_quality(TRUTH[:2], TRUTH)
+    assert scores.pq == pytest.approx(2.0 / 2.5)
+    assert scores.false_negative == 1
+
+    # All three found plus one spurious: 3 / (3 + 0.5) = 0.857
+    scores = panoptic_quality(TRUTH + _segments((100, 110, 10, 90)), TRUTH)
+    assert scores.pq == pytest.approx(3.0 / 3.5)
+    assert scores.false_positive == 1
+
+
+def test_panoptic_quality_punishes_splitting_a_filament():
+    """Fragmentation is the failure the challenge singles out."""
+    from filaseg.metrics import panoptic_quality
+
+    split = _segments(
+        (10, 20, 10, 45), (10, 20, 50, 90), (40, 50, 10, 90), (70, 80, 10, 90)
+    )
+    scores = panoptic_quality(split, TRUTH)
+    assert scores.pq < 0.7
+    assert scores.false_positive == 2 and scores.false_negative == 1
+
+
+def test_panoptic_quality_punishes_merging_filaments():
+    from filaseg.metrics import panoptic_quality
+
+    merged = _segments((10, 50, 10, 90), (70, 80, 10, 90))
+    scores = panoptic_quality(merged, TRUTH)
+    assert scores.pq < 0.5
+    assert scores.false_negative == 2
+
+
+def test_panoptic_quality_separates_recognition_from_segmentation():
+    """A small offset keeps every match but degrades their quality."""
+    from filaseg.metrics import panoptic_quality
+
+    shifted = _segments((12, 22, 10, 90), (42, 52, 10, 90), (72, 82, 10, 90))
+    scores = panoptic_quality(shifted, TRUTH)
+    assert scores.rq == pytest.approx(1.0)   # every filament still recognised
+    assert scores.sq < 1.0                   # but the overlap is worse
+    assert scores.pq == pytest.approx(scores.sq * scores.rq, rel=1e-6)
+
+
+def test_panoptic_quality_edge_cases():
+    from filaseg.metrics import panoptic_quality
+
+    assert panoptic_quality([], []).pq == pytest.approx(1.0)
+    assert panoptic_quality([], TRUTH).pq == pytest.approx(0.0)
+    assert panoptic_quality(TRUTH, []).pq == pytest.approx(0.0)
+
+
+def test_fragmentation_names_the_failure():
+    from filaseg.metrics import fragmentation
+
+    clean = fragmentation(TRUTH, TRUTH)
+    assert clean.one_to_one == 3
+    assert clean.one_to_many == 0 and clean.many_to_one == 0
+
+    split = _segments(
+        (10, 20, 10, 45), (10, 20, 50, 90), (40, 50, 10, 90), (70, 80, 10, 90)
+    )
+    assert fragmentation(split, TRUTH).one_to_many == 1
+    assert fragmentation(split, TRUTH).fragments_per_split == pytest.approx(2.0)
+
+    merged = _segments((10, 50, 10, 90), (70, 80, 10, 90))
+    assert fragmentation(merged, TRUTH).many_to_one == 1
+
+
+def test_fragmentation_counts_misses_and_spurious():
+    from filaseg.metrics import fragmentation
+
+    assert fragmentation(TRUTH[:2], TRUTH).missed == 1
+    assert fragmentation(TRUTH + _segments((100, 110, 10, 90)), TRUTH).spurious == 1
+    assert fragmentation([], TRUTH).missed == 3
+    assert fragmentation(TRUTH, []).spurious == 3
+
+
+def test_evaluate_reports_the_challenge_metrics():
+    labels = np.zeros((128, 128), dtype=np.int32)
+    for index, mask in enumerate(TRUTH, start=1):
+        labels[mask] = index
+
+    result = evaluate(labels.copy(), labels)
+    for key in ("pq", "sq", "rq", "dice", "one_to_many", "many_to_one"):
+        assert key in result
+    assert result["pq"] == pytest.approx(1.0)
+    assert result["dice"] == pytest.approx(1.0)
+
+
+def test_aggregate_sums_panoptic_counts():
+    from filaseg.metrics import aggregate
+
+    merged = aggregate([
+        {"pq": 0.4, "pq_tp": 1, "one_to_many": 2},
+        {"pq": 0.8, "pq_tp": 3, "one_to_many": 0},
+    ])
+    assert merged["pq"] == pytest.approx(0.6)     # rates are averaged
+    assert merged["pq_tp"] == pytest.approx(4)    # counts are summed
+    assert merged["one_to_many"] == pytest.approx(2)

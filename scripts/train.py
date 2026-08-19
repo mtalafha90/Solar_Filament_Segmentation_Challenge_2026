@@ -81,6 +81,10 @@ def main() -> None:
                         help="share of crops centred on a filament (default 0.7)")
     parser.add_argument("--val-tile", type=int, dest="val_tile",
                         help="tile size used when validating on whole disks")
+    parser.add_argument("--selection-metric", type=str, dest="selection_metric",
+                        choices=("pq", "dice", "iou"),
+                        help="metric that picks the threshold and best checkpoint "
+                             "(default pq, the challenge's ranking metric)")
     parser.add_argument("--warmup-epochs", type=int, dest="warmup_epochs")
     parser.add_argument("--weight-decay", type=float, dest="weight_decay")
     parser.add_argument("--num-workers", type=int, dest="num_workers")

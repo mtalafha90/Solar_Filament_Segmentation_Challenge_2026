@@ -221,6 +221,7 @@ def generate_observation(
     network_amplitude: float = 0.05,
     plage_amplitude: float = 0.07,
     width_scale: float = 1.0,
+    limb_rim: float = 0.0,
 ) -> SyntheticObservation:
     """Generate one synthetic full-disk H-alpha observation with ground truth.
 
@@ -241,6 +242,12 @@ def generate_observation(
         plage_amplitude: Strength of the bright plage patches.
         width_scale: Multiplies filament widths, for generating at a different
             resolution while keeping the apparent shape.
+        limb_rim: Strength of a bright ring just inside the limb, standing in
+            for the chromospheric emission and spicules that real H-alpha shows
+            there. This is the single most destructive artefact for a detector
+            that keys on local intensity: after limb-darkening is divided out,
+            the rim survives as an enormous positive residual and dominates the
+            score map unless the outer annulus is excluded.
 
     Returns:
         A :class:`SyntheticObservation`.
@@ -302,6 +309,11 @@ def generate_observation(
         dist = np.hypot(yy - spot_y, xx - spot_x)
         umbra = np.clip(1.0 - (dist / spot_radius) ** 2, 0.0, 1.0) ** 0.6
         image *= 1.0 - rng.uniform(0.35, 0.7) * umbra
+
+    # A bright chromospheric rim just inside the limb, as real H-alpha shows.
+    if limb_rim > 0:
+        rim = np.exp(-(((radius_map - 0.985) / 0.012) ** 2))
+        image *= 1.0 + limb_rim * rim
 
     # Ground-based effects: a smooth transmission gradient, then noise.
     image *= 1.0 + 0.10 * _smooth_noise(shape, size / 6.0, rng)

@@ -17,6 +17,8 @@ together at inference.
 from __future__ import annotations
 
 import hashlib
+import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -40,6 +42,14 @@ from ..preprocessing.photometry import preprocess
 from .coco import ImageId, ImageRecord, load_coco, normalise_id, rescale_record
 from .io import find_image, read_image
 from .targets import boundary_map, distance_weight, spine_heatmap
+
+# Bumped whenever the cache layout changes, so stale files are simply ignored
+# rather than loaded and misinterpreted.
+CACHE_VERSION = 3
+
+# Upper bound used when quantising the per-pixel loss weights into a byte.
+# distance_weight tops out at base + boundary_gain + thin_gain = 6 by default.
+WEIGHT_MAX = 8.0
 
 
 @dataclass
@@ -190,20 +200,9 @@ class MagfiloDataset:
         cache_path = self._cache_path(record)
 
         if cache_path is not None and cache_path.exists():
-            with np.load(cache_path) as blob:
-                return PreparedObservation(
-                    image=blob["image"],
-                    valid=blob["valid"].astype(bool),
-                    mu=blob["mu"],
-                    mask=blob["mask"].astype(bool),
-                    instances=blob["instances"],
-                    spine=blob["spine"],
-                    boundary=blob["boundary"],
-                    weight=blob["weight"],
-                    disk=SolarDisk(*[float(v) for v in blob["disk"]]),
-                    image_id=normalise_id(blob["image_id"].item()),
-                    file_name=str(blob["file_name"]),
-                )
+            prepared = self._load_cache(cache_path)
+            if prepared is not None:
+                return prepared
 
         image = read_image(find_image(self.image_dir, record.file_name))
         if record.height == 0 or record.width == 0:
@@ -225,24 +224,98 @@ class MagfiloDataset:
         prepared = prepare_observation(image, record=record)
 
         if cache_path is not None:
-            np.savez_compressed(
-                cache_path,
-                image=prepared.image,
-                valid=prepared.valid,
-                mu=prepared.mu,
-                mask=prepared.mask,
-                instances=prepared.instances,
-                spine=prepared.spine,
-                boundary=prepared.boundary,
-                weight=prepared.weight,
-                disk=np.array(
-                    [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
-                    dtype=np.float64,
-                ),
-                image_id=str(prepared.image_id),
-                file_name=prepared.file_name,
-            )
+            self._save_cache(cache_path, prepared)
         return prepared
+
+    # ------------------------------------------------------------------
+    # Cache
+    #
+    # A full-resolution GONG frame carries eight arrays at 2048x2048. Stored
+    # naively that is ~18 MB per observation, or 12.6 GB for a 700-frame
+    # training set -- enough to matter on a laptop or a shared disk. So we store
+    # only what is expensive to recompute, at the smallest precision that does
+    # not lose information, and rebuild the rest on load:
+    #
+    #   * ``mu`` follows from the disk geometry by arithmetic;
+    #   * ``mask`` is just ``instances > 0``.
+    #
+    # ``boundary`` and ``weight`` are stored rather than recomputed: the
+    # distance transform behind ``weight`` costs 0.8 s on a 2048-pixel frame,
+    # which dwarfs the few hundred kilobytes it takes to keep.
+    #
+    # The image is normalised to [0, 1] and the spine is a [0, 1] heatmap, so
+    # float16 and uint8 are finer than the 8-bit JPEGs they came from. Weights
+    # are quantised over [0, WEIGHT_MAX], well above the values
+    # :func:`~filaseg.data.targets.distance_weight` produces.
+    # ------------------------------------------------------------------
+
+    def _save_cache(self, path: Path, prepared: PreparedObservation) -> None:
+        np.savez_compressed(
+            path,
+            version=np.array(CACHE_VERSION),
+            image=prepared.image.astype(np.float16),
+            valid=np.packbits(prepared.valid),
+            instances=prepared.instances.astype(np.uint16),
+            spine=(np.clip(prepared.spine, 0.0, 1.0) * 255).astype(np.uint8),
+            boundary=np.packbits(prepared.boundary > 0.5),
+            weight=(
+                np.clip(prepared.weight / WEIGHT_MAX, 0.0, 1.0) * 255
+            ).astype(np.uint8),
+            shape=np.array(prepared.image.shape, dtype=np.int32),
+            disk=np.array(
+                [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
+                dtype=np.float64,
+            ),
+            image_id=str(prepared.image_id),
+            file_name=prepared.file_name,
+        )
+
+    def _load_cache(self, path: Path) -> PreparedObservation | None:
+        """Read a cached observation, or return None if it is stale or damaged."""
+        try:
+            with np.load(path) as blob:
+                if int(blob["version"]) != CACHE_VERSION:
+                    return None
+                shape = tuple(int(v) for v in blob["shape"])
+                image = blob["image"].astype(np.float32)
+                valid = np.unpackbits(blob["valid"], count=shape[0] * shape[1]).astype(
+                    bool
+                ).reshape(shape)
+                instances = blob["instances"].astype(np.int32)
+                spine = blob["spine"].astype(np.float32) / 255.0
+                count = shape[0] * shape[1]
+                boundary = (
+                    np.unpackbits(blob["boundary"], count=count)
+                    .astype(np.float32)
+                    .reshape(shape)
+                )
+                weight = blob["weight"].astype(np.float32) / 255.0 * WEIGHT_MAX
+                disk = SolarDisk(*[float(v) for v in blob["disk"]])
+                image_id = normalise_id(blob["image_id"].item())
+                file_name = str(blob["file_name"])
+        except (KeyError, ValueError, OSError, EOFError, zipfile.BadZipFile):
+            # A cache written by an older version, or a file truncated by an
+            # interrupted run -- an .npz is a zip, so a partial write raises
+            # BadZipFile. Recomputing is always safe, so never let a damaged
+            # cache stop training.
+            return None
+
+        mask = instances > 0
+        radius_map = disk.radial_map(shape)
+        mu = np.sqrt(np.clip(1.0 - np.clip(radius_map, 0.0, 1.0) ** 2, 0.0, 1.0))
+        return PreparedObservation(
+            image=image,
+            valid=valid,
+            mu=(mu * valid).astype(np.float32),
+            mask=mask,
+            instances=instances,
+            spine=spine,
+            boundary=boundary,
+            weight=weight,
+            disk=disk,
+            image_id=image_id,
+            file_name=file_name,
+        )
 
 
 class FilamentPatchDataset(Dataset):
@@ -257,6 +330,10 @@ class FilamentPatchDataset(Dataset):
             teaches the model to reject sunspots and other dark distractors.
         augment: Apply dihedral and photometric augmentation.
         seed: Seed for reproducible sampling.
+        max_cached: How many prepared observations to hold in memory at once.
+            A full-resolution frame is about 110 MB, so this bounds the dataset's
+            footprint; lower it if memory is tight, raise it if you have room and
+            want fewer re-reads from the disk cache.
     """
 
     def __init__(
@@ -267,6 +344,7 @@ class FilamentPatchDataset(Dataset):
         positive_fraction: float = 0.7,
         augment: bool = True,
         seed: int = 0,
+        max_cached: int = 12,
     ) -> None:
         if not _TORCH:  # pragma: no cover
             raise ImportError("FilamentPatchDataset needs PyTorch installed")
@@ -276,9 +354,15 @@ class FilamentPatchDataset(Dataset):
         self.positive_fraction = float(positive_fraction)
         self.augment = bool(augment)
         self.seed = int(seed)
+        self.max_cached = max(1, int(max_cached))
         self._epoch = 0
-        self._cache: dict[int, PreparedObservation] = {}
-        self._positions: dict[int, np.ndarray] = {}
+        # Least-recently-used, and bounded on purpose. A prepared 2048-pixel
+        # observation is about 110 MB in memory, so holding a 700-frame training
+        # set would need 77 GB. Twelve is roughly 1.3 GB and is plenty, because
+        # crops are drawn at random and each observation is revisited often
+        # while it is resident.
+        self._cache: OrderedDict[int, PreparedObservation] = OrderedDict()
+        self._positions: OrderedDict[int, np.ndarray] = OrderedDict()
 
     def set_epoch(self, epoch: int) -> None:
         """Change the sampling seed between epochs so crops differ each pass."""
@@ -288,9 +372,16 @@ class FilamentPatchDataset(Dataset):
         return self.samples_per_epoch
 
     def _observation(self, index: int) -> PreparedObservation:
-        if index not in self._cache:
-            self._cache[index] = self.source[index]
-        return self._cache[index]
+        if index in self._cache:
+            self._cache.move_to_end(index)
+            return self._cache[index]
+
+        prepared = self.source[index]
+        self._cache[index] = prepared
+        while len(self._cache) > self.max_cached:
+            evicted, _ = self._cache.popitem(last=False)
+            self._positions.pop(evicted, None)
+        return prepared
 
     def _filament_positions(self, index: int, prepared: PreparedObservation) -> np.ndarray:
         if index not in self._positions:

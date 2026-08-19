@@ -115,7 +115,10 @@ python scripts/train.py --config configs/default.yaml \
 Notes:
 
 - The **first epoch is slow** — every frame is preprocessed and cached to
-  `data/cache`. Later epochs read the cache and are much faster.
+  `data/cache`. Later epochs read the cache and are much faster. Budget roughly
+  **4 MB of disk per training image** (about 3 GB for MAGFiLO's 707 frames), and
+  a few seconds per frame for that first pass. Drop `--cache-dir` if you would
+  rather trade the disk for slower epochs.
 - Add `--device cpu` if you have no GPU. Expect it to be slow; drop
   `--patch-size` to 128 and `--samples-per-epoch` to a few hundred to test the
   loop before committing to a full run.
@@ -199,6 +202,13 @@ distributed JPEGs were resized from the annotated frames. The loader rescales
 the annotations to the image automatically and only warns once.
 
 **Out of GPU memory** — lower `--batch-size`, then `--patch-size`.
+
+**Out of system memory** — the dataset holds at most 12 preprocessed frames in
+RAM at once (roughly 1.3 GB at full resolution). Lower `max_cached` on
+`FilamentPatchDataset` if that is still too much.
+
+**A cache file was corrupted by an interrupted run** — nothing to do. Damaged or
+outdated cache entries are detected and recomputed automatically.
 
 **Training loss goes to zero and nothing is predicted** — the positive class is
 being ignored. Raise `pos_weight` in `configs/default.yaml` to the value

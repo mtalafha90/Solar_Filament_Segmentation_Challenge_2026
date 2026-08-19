@@ -127,7 +127,10 @@ detector, which needs no weights and runs in a couple of seconds per frame.
 Two practical notes:
 
 - The first epoch is slow because every frame is preprocessed; results are
-  cached to `--cache-dir` and later epochs read them straight back.
+  cached to `--cache-dir` and later epochs read them straight back. The cache
+  costs about 4 MB per training image — roughly 3 GB for MAGFiLO — because it
+  stores only what is expensive to recompute, at the smallest precision that
+  does not lose information.
 - Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
   observations by the original GONG frame name (`040301-20140609195854Bh`)
   rather than an integer, and submissions carry those names back unchanged.
@@ -371,7 +374,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-128 tests cover geometry, photometry, annotation parsing and encoding, the loss
+132 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

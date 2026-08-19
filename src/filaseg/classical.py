@@ -79,7 +79,16 @@ class ClassicalConfig:
     """Explicit growing percentile, overriding the derived one when set."""
     background_scale: float = 48.0
     """Length scale of the local background estimate, in pixels."""
-    instance: InstanceConfig = field(default_factory=InstanceConfig)
+    instance: InstanceConfig = field(
+        default_factory=lambda: InstanceConfig(reject_round=True)
+    )
+    """Post-processing settings.
+
+    Shape-based sunspot rejection is switched on here, unlike the global
+    default: this detector keys on darkness and elongation, so sunspots do get
+    through and must be removed geometrically.  A trained network does not need
+    it -- see :class:`~filaseg.postprocess.instances.InstanceConfig`.
+    """
 
 
 def ridge_response(image: np.ndarray, scales: tuple[float, ...]) -> np.ndarray:

@@ -40,8 +40,21 @@ class InstanceConfig:
     """Largest gap in pixels across which two fragments may be rejoined."""
     merge_angle: float = 45.0
     """Largest misalignment in degrees permitted when rejoining fragments."""
-    reject_round: bool = True
-    """Remove compact, round blobs, which are almost always sunspots."""
+    reject_round: bool = False
+    """Remove compact, round blobs, which are almost always sunspots.
+
+    Off by default, and that default is deliberate.  This filter is essential
+    for the classical detector, which has no way to tell a sunspot from a
+    filament and would otherwise report every one (measured: false discovery
+    rate 0.60 without it, 0.14 with).  A trained network, however, has already
+    learned to ignore sunspots -- it does not predict them at all -- so the
+    filter finds nothing to remove and instead deletes genuine short, compact
+    filaments.  Measured on synthetic validation frames, switching it on after
+    FilaNet cost 0.145 IoU and dropped the hit rate from 0.96 to 0.73.
+
+    Rule of thumb: enable it for any detector that cannot reject sunspots
+    itself, and leave it off for one that can.
+    """
     max_roundness_area: int = 900
     """Only blobs below this area are eligible for rejection as sunspots."""
     min_axis_ratio: float = 1.7

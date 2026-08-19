@@ -102,9 +102,16 @@ def test_extract_instances_runs_the_whole_chain():
     yy, xx = np.ogrid[:200, :200]
     probability[(yy - 40) ** 2 + (xx - 40) ** 2 <= 64] = 1.0
 
-    labels = extract_instances(probability, config=InstanceConfig(min_area=30))
-    assert labels.max() == 1  # fragments merged, sunspot rejected
-    assert labels.dtype == np.int32
+    # Sunspot rejection is off by default, so the round blob survives.
+    kept = extract_instances(probability, config=InstanceConfig(min_area=30))
+    assert kept.max() == 2  # fragments merged; sunspot still present
+    assert kept.dtype == np.int32
+
+    # Switching it on, as the classical detector does, removes the sunspot.
+    labels = extract_instances(
+        probability, config=InstanceConfig(min_area=30, reject_round=True)
+    )
+    assert labels.max() == 1
 
 
 def test_extract_instances_on_an_empty_map():
@@ -216,3 +223,25 @@ def test_classical_config_is_overridable(observation):
     assert (detect(observation.image, strict) > 0).sum() < (
         detect(observation.image, loose) > 0
     ).sum()
+
+
+def test_sunspot_rejection_is_off_by_default():
+    """The default must not delete detections; the classical detector opts in.
+
+    A trained network already ignores sunspots, so applying the shape filter to
+    its output only removes genuine short filaments. The classical detector
+    cannot tell the two apart, so it enables the filter explicitly.
+    """
+    from filaseg.classical import ClassicalConfig
+    from filaseg.postprocess.instances import InstanceConfig
+
+    assert InstanceConfig().reject_round is False
+    assert ClassicalConfig().instance.reject_round is True
+
+
+def test_default_post_processing_keeps_a_compact_filament():
+    probability = np.zeros((128, 128), dtype=np.float32)
+    # A short, stubby filament that a shape filter would wrongly discard.
+    probability[60:70, 40:58] = 1.0
+    labels = extract_instances(probability, config=InstanceConfig(min_area=30))
+    assert labels.max() == 1

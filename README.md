@@ -232,11 +232,20 @@ connected-component labelling does not give you:
   *and* both spines run along the line joining them. Requiring the directions to
   agree is what stops two unrelated filaments that happen to pass close by from
   being welded together.
-- **Sunspot rejection by shape.** Small, round components are removed using
-  second-moment axis ratios, so the test transfers across instruments instead of
-  depending on a brightness cutoff. Large round regions are kept, since those
-  are more likely to be genuine filament complexes. On synthetic frames with a
-  heavy sunspot load this cuts the false discovery rate from 0.60 to 0.14.
+- **Sunspot rejection by shape**, for detectors that need it. Small, round
+  components are removed using second-moment axis ratios, so the test transfers
+  across instruments instead of depending on a brightness cutoff. On synthetic
+  frames with a heavy sunspot load this cuts the classical detector's false
+  discovery rate from 0.60 to 0.14.
+
+  **It is off by default, and that matters.** A trained network has already
+  learned to ignore sunspots — it does not predict them at all — so the filter
+  finds nothing to remove and instead deletes genuine short, compact filaments.
+  Measured on validation frames, switching it on after FilaNet cost 0.145 IoU
+  and dropped the hit rate from 0.96 to 0.73. The classical detector enables it
+  explicitly because it cannot tell a sunspot from a filament on its own. The
+  rule: enable it for a detector that cannot reject sunspots itself, leave it
+  off for one that can.
 
 ### 6. The classical detector
 
@@ -328,7 +337,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-107 tests cover geometry, photometry, annotation parsing and encoding, the loss
+113 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

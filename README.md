@@ -306,6 +306,37 @@ which is precisely why the loss cannot rely on it.
 
 ---
 
+## Results
+
+Full detail in [`docs/results.md`](docs/results.md). Headline comparison, both
+detectors on the same held-out synthetic frames:
+
+| Metric | Classical | FilaNet |
+|---|---|---|
+| IoU | 0.622 | **0.878** |
+| clDice | 0.747 | **0.977** |
+| MSIoU | 0.625 | **0.863** |
+| Hit rate | 0.583 | **0.958** |
+| mAP | 0.536 | **0.928** |
+
+**These are synthetic figures, not competition scores.** Real GONG observations
+are harder in ways synthetic data cannot capture. They show the pipeline is
+correct end to end; re-run the ablation on MAGFiLO before trusting any of the
+design conclusions.
+
+Two findings worth carrying over:
+
+- **The clDice term is a trade, not a free gain.** Removing it *raises* pixel
+  IoU by 0.023 and *lowers* clDice by 0.011. It spends area agreement to buy
+  topological fidelity, which is the right purchase when fine structure is
+  scored and the wrong one if you are optimising pixel IoU alone.
+- **Edge attention, the auxiliary heads and deep supervision all came out flat**
+  on synthetic data — differences of half a per cent or less, inside run-to-run
+  noise. That is reported as a null result rather than omitted. Synthetic barbs
+  are too clean to test an edge prior properly and the ablation model is small,
+  so this benchmark cannot resolve them. Treat them as unproven until the
+  ablation is repeated on the real data.
+
 ## Repository layout
 
 ```
@@ -337,7 +368,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-113 tests cover geometry, photometry, annotation parsing and encoding, the loss
+115 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

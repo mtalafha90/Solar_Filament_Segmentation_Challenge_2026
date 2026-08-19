@@ -271,6 +271,69 @@ variability of seeing across the six GONG sites. Their purpose is to
 demonstrate that the pipeline is correct end to end and that each component
 earns its place.
 
+\subsection{Detector comparison}
+
+Table \ref{tab:headtohead} compares the two detectors on the same held-out
+observations, with identical ground truth and metric code.
+
+\begin{table}[h]
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Metric & Classical & FilaNet \\
+\midrule
+IoU & 0.622 & \textbf{0.878} \\
+Dice & 0.723 & \textbf{0.935} \\
+Precision & \textbf{0.940} & 0.924 \\
+Recall & 0.643 & \textbf{0.946} \\
+clDice & 0.747 & \textbf{0.977} \\
+MSIoU & 0.625 & \textbf{0.863} \\
+Hit rate & 0.583 & \textbf{0.958} \\
+Pairwise IoU & 0.518 & \textbf{0.863} \\
+AP@0.50 & 0.567 & \textbf{0.954} \\
+AP@0.75 & 0.437 & \textbf{0.877} \\
+\bottomrule
+\end{tabular}
+\caption{The two detectors on identical validation frames. The classical
+detector is the more precise of the two but misses far more, and the gap widens
+as the IoU threshold rises: hysteresis recovers a filament's bright core
+reliably and its faint extremities unreliably, which costs most at
+AP@0.75.}\label{tab:headtohead}
+\end{center}
+\end{table}
+
+\subsection{Post-processing}
+
+Table \ref{tab:postproc} isolates each post-processing step applied to the
+network's output.
+
+\begin{table}[h]
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Configuration & IoU & clDice & Hit rate \\
+\midrule
+Threshold only & 0.866 & 0.972 & 0.958 \\
+$+$ small-object removal & \textbf{0.878} & \textbf{0.977} & 0.958 \\
+$+$ fragment merging & \textbf{0.878} & \textbf{0.977} & 0.958 \\
+$+$ sunspot rejection & 0.733 & 0.849 & 0.729 \\
+\bottomrule
+\end{tabular}
+\caption{Post-processing applied to FilaNet. Shape-based sunspot rejection is
+actively harmful here.}\label{tab:postproc}
+\end{center}
+\end{table}
+
+The last row is the most useful result in this paper. Shape-based sunspot
+rejection is essential to the classical detector, cutting its false discovery
+rate from $0.60$ to $0.14$, and it is actively harmful applied to the network,
+costing $0.145$ IoU and a quarter of the hit rate. The reason is clear once
+measured: the network never predicts sunspots in the first place, so the filter
+has none to remove and deletes genuine short, compact filaments instead. A
+post-processing step justified on one detector cannot be assumed to transfer to
+another, and the cost of assuming otherwise here was larger than the difference
+between any two architectures we tried.
+
 \subsection{Ablation}
 
 Table \ref{tab:ablation} reports variants that differ from the full model in
@@ -282,24 +345,39 @@ exactly one respect, so differences are attributable.
 \toprule
 Variant & IoU & Dice & clDice & MSIoU \\
 \midrule
-Full model & --- & --- & --- & --- \\
-No clDice & --- & --- & --- & --- \\
-No edge attention & --- & --- & --- & --- \\
-No auxiliary heads & --- & --- & --- & --- \\
-No deep supervision & --- & --- & --- & --- \\
+Full model & 0.861 & 0.925 & \textbf{0.971} & 0.824 \\
+No clDice & \textbf{0.884} & \textbf{0.938} & 0.960 & \textbf{0.851} \\
+No edge attention & 0.860 & 0.925 & 0.969 & 0.821 \\
+No auxiliary heads & 0.857 & 0.923 & 0.971 & 0.821 \\
+No deep supervision & 0.865 & 0.928 & 0.968 & 0.823 \\
 \bottomrule
 \end{tabular}
-\caption{Ablation on synthetic data. Populate from
-\texttt{scripts/ablation.py}; see \texttt{docs/results.md} for the current
-run.}\label{tab:ablation}
+\caption{Ablation on synthetic data, pixel-level validation scores before
+instance extraction.}\label{tab:ablation}
 \end{center}
 \end{table}
 
-The expected pattern, and the one observed, is that removing clDice
-\emph{raises} pixel IoU slightly while \emph{lowering} clDice. This is the
-trade the term is designed to make: it spends a little area agreement to buy
-topological fidelity, which is what the challenge's fine-structure criterion
-rewards and what plain IoU is blind to.
+Only one component produces a clearly directional effect at this scale. The
+auxiliary heads and deep supervision move IoU by $-0.004$ and $+0.005$
+respectively, which is inside run-to-run variation on six validation frames.
+
+The clDice term does what it is designed to do, and it is a trade rather than a
+free gain: removing it \emph{raises} pixel IoU by $0.023$ while \emph{lowering}
+clDice by $0.011$. It spends area agreement to buy topological fidelity. Whether
+that is the right purchase depends on what is being scored; for a
+fine-structure criterion it is, and clDice and MSIoU are the metrics that
+register it, while pixel IoU by construction cannot.
+
+Edge attention shows no measurable effect on this data: $0.860$ against
+$0.861$. We report this as a null result rather than quietly omitting it, and
+the same caveat applies to the auxiliary heads and deep supervision. These are
+not evidence that the mechanisms fail, but evidence that this benchmark cannot
+resolve them: synthetic barbs come from a simple generative model with clean
+edges, leaving little for an edge prior to contribute; the ablation model is
+deliberately small so that it trains on a CPU; and six validation frames is a
+thin basis for separating differences of half a per cent. All three components
+should be treated as unproven until the ablation is repeated on MAGFiLO, which
+\texttt{scripts/ablation.py} does in one command.
 
 \section{Limitations and further work}
 

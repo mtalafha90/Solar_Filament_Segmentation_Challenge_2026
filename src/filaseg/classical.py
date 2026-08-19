@@ -30,7 +30,7 @@ from scipy import ndimage as ndi
 
 from .postprocess.instances import InstanceConfig, extract_instances
 from .preprocessing.disk import SolarDisk
-from .preprocessing.photometry import preprocess
+from .preprocessing.photometry import preprocess, smooth_background
 
 
 @dataclass
@@ -95,35 +95,81 @@ class ClassicalConfig:
     """
 
 
-def ridge_response(image: np.ndarray, scales: tuple[float, ...]) -> np.ndarray:
-    """Multi-scale ridge strength for bright elongated structures.
+def _hessian_ridge(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Ridge strength at one scale, from the Hessian eigenvalues.
 
-    At each scale we take the Hessian's eigenvalues.  A ridge has one large
-    negative eigenvalue across its width and one near zero along its length; a
-    blob has two large negative eigenvalues.  Scoring the difference therefore
-    rewards elongation and suppresses round features such as sunspots.
+    A ridge has one large negative eigenvalue across its width and one near zero
+    along its length; a blob has two large negative ones. Scoring the difference
+    therefore rewards elongation and suppresses round features such as sunspots.
+
+    Responses are normalised by ``sigma**2`` so that scales are comparable, which
+    is what lets one threshold serve thin barbs and fat filament bodies alike.
+    """
+    dyy = ndi.gaussian_filter(image, sigma, order=(2, 0), mode="nearest") * sigma**2
+    dxx = ndi.gaussian_filter(image, sigma, order=(0, 2), mode="nearest") * sigma**2
+    dxy = ndi.gaussian_filter(image, sigma, order=(1, 1), mode="nearest") * sigma**2
+
+    trace = dyy + dxx
+    difference = dyy - dxx
+    root = np.sqrt(np.maximum(difference**2 + 4.0 * dxy**2, 0.0))
+    lambda1 = 0.5 * (trace + root)  # larger eigenvalue
+    lambda2 = 0.5 * (trace - root)  # smaller (most negative) eigenvalue
+
+    # A bright ridge: lambda2 strongly negative, lambda1 near zero.
+    response = np.maximum(-lambda2, 0.0) - np.maximum(np.abs(lambda1), 0.0)
+    return np.maximum(response, 0.0)
+
+
+def ridge_response(
+    image: np.ndarray,
+    scales: tuple[float, ...],
+    max_direct_sigma: float = 12.0,
+) -> np.ndarray:
+    """Multi-scale ridge strength for bright elongated structures.
 
     The image is expected to have filaments *bright*, which is what the
     preprocessing chain produces.
+
+    Scales wider than ``max_direct_sigma`` are evaluated on a decimated grid and
+    interpolated back. The sigma-squared normalisation makes the response
+    scale-covariant, so halving the grid and halving sigma gives nearly the same
+    answer.
+
+    The default leaves the shipped scales exact, deliberately. Unlike the smooth
+    background estimates -- where decimation is free, costing a relative error of
+    3e-4 -- decimating the ridge filter measurably moves the detections: at a
+    threshold of 3 pixels the predicted masks agreed with the exact ones at only
+    0.97 IoU, and clDice fell by 0.011, for a 27% saving. Lower it if you need
+    the speed and can afford that, but measure the effect on your data first.
+
+    Args:
+        image: Preprocessed image, filaments bright.
+        scales: Ridge filter widths in pixels.
+        max_direct_sigma: Widths above this are computed decimated. The default
+            keeps every shipped scale exact.
     """
     best = np.zeros(image.shape, dtype=np.float32)
     for sigma in scales:
-        # Second derivatives of the Gaussian-smoothed image, taken in a single
-        # pass. Scaling by sigma^2 makes responses comparable across scales,
-        # which is what lets a single threshold serve thin barbs and fat bodies.
-        dyy = ndi.gaussian_filter(image, sigma, order=(2, 0), mode="nearest") * sigma**2
-        dxx = ndi.gaussian_filter(image, sigma, order=(0, 2), mode="nearest") * sigma**2
-        dxy = ndi.gaussian_filter(image, sigma, order=(1, 1), mode="nearest") * sigma**2
+        factor = 1
+        if sigma > max_direct_sigma:
+            factor = max(1, int(sigma // max_direct_sigma))
 
-        trace = dyy + dxx
-        difference = dyy - dxx
-        root = np.sqrt(np.maximum(difference**2 + 4.0 * dxy**2, 0.0))
-        lambda1 = 0.5 * (trace + root)  # larger eigenvalue
-        lambda2 = 0.5 * (trace - root)  # smaller (most negative) eigenvalue
+        if factor > 1:
+            from skimage.measure import block_reduce
 
-        # A bright ridge: lambda2 strongly negative, lambda1 near zero.
-        response = np.maximum(-lambda2, 0.0) - np.maximum(np.abs(lambda1), 0.0)
-        np.maximum(best, np.maximum(response, 0.0), out=best)
+            small = block_reduce(image, (factor, factor), np.mean)
+            response = _hessian_ridge(small, sigma / factor)
+            response = ndi.zoom(
+                response,
+                (image.shape[0] / response.shape[0], image.shape[1] / response.shape[1]),
+                order=1,
+                mode="nearest",
+            )
+            response = response[: image.shape[0], : image.shape[1]]
+        else:
+            response = _hessian_ridge(image, sigma)
+
+        np.maximum(best, response.astype(np.float32), out=best)
     return best
 
 
@@ -137,10 +183,7 @@ def intensity_deficit(
     off-disk region does not bleed in near the limb.
     """
     weights = valid.astype(np.float32)
-    filled = image * weights
-    smoothed = ndi.gaussian_filter(filled, scale, mode="nearest")
-    norm = ndi.gaussian_filter(weights, scale, mode="nearest")
-    background = smoothed / np.maximum(norm, 1e-6)
+    background = smooth_background(image * weights, weights, scale)
     return np.maximum(image - background, 0.0).astype(np.float32)
 
 

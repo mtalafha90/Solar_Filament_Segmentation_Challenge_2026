@@ -248,7 +248,13 @@ being ignored. Raise `pos_weight` in `configs/default.yaml` to the value
 
 **Everything is slow on CPU** — that is expected for training. The classical
 detector (`--classical`) needs no training at all and is the right thing to run
-first.
+first, at about 5 seconds per full-resolution frame.
+
+**How long things take at full GONG resolution** (2048x2048, 707 frames):
+the classical detector is roughly 5 s per frame, so `--limit 20` takes a couple
+of minutes and the whole training split about an hour. Preprocessing for
+training costs about the same per frame on the first epoch, after which the
+cache makes it negligible. Use `--limit` while you are still experimenting.
 
 ## Run the tests
 

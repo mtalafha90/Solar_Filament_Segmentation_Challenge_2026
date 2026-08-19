@@ -86,9 +86,13 @@ def main() -> None:
     instance_config = InstanceConfig(threshold=threshold, min_area=args.min_area)
 
     per_image: list[dict] = []
+    inference_seconds = 0.0
     started = time.time()
     for position, index in enumerate(indices, start=1):
         prepared = dataset[index]
+        # Timed separately from scoring: the challenge assesses the pipeline's
+        # speed, not the evaluator's.
+        inference_started = time.time()
         if args.classical:
             raw = read_image(find_image(args.image_dir, prepared.file_name))
             labels = detect(raw)
@@ -96,6 +100,7 @@ def main() -> None:
             probability = predict_probability(model, prepared.input_stack(), inference_config)
             labels = extract_instances(probability * prepared.valid, prepared.valid,
                                        instance_config)
+        inference_seconds += time.time() - inference_started
 
         # Ground-truth instances come straight from the annotations.
         scores = evaluate(labels, prepared.instances, prepared.valid)
@@ -105,8 +110,10 @@ def main() -> None:
             print(f"  {position} done", flush=True)
 
     elapsed = time.time() - started
+    count = max(len(per_image), 1)
     summary = aggregate([{k: v for k, v in r.items() if k != "image_id"} for r in per_image])
-    summary["seconds_per_image"] = elapsed / max(len(per_image), 1)
+    summary["inference_seconds_per_image"] = inference_seconds / count
+    summary["total_seconds_per_image"] = elapsed / count
 
     groups = [
         ("RANKED ON", ["pq", "dice"]),
@@ -120,11 +127,13 @@ def main() -> None:
          ["hit_rate", "miss_rate", "false_discovery_rate", "mean_pairwise_iou",
           "AP@0.25", "AP@0.50", "AP@0.75", "mAP"]),
         ("COUNTS", ["n_predicted", "n_truth", "n_matched", "n_images"]),
-        ("EFFICIENCY", ["seconds_per_image"]),
+        ("EFFICIENCY", ["inference_seconds_per_image", "total_seconds_per_image"]),
     ]
     print("\n" + "=" * 58)
     print("RESULTS")
     print("=" * 58)
+    print("  (inference time is what the challenge assesses; the total also "
+          "includes scoring)")
     for title, keys in groups:
         present = [k for k in keys if k in summary]
         if not present:

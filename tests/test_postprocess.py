@@ -323,3 +323,58 @@ def test_detector_scales_itself_to_the_frame():
     assert scores[256] > 0.3 and scores[512] > 0.3
     # Neither resolution should be dramatically worse than the other.
     assert min(scores.values()) > 0.6 * max(scores.values())
+
+
+def test_instance_lengths_follow_the_solar_radius():
+    """Every length describes the Sun, not the sensor, so all scale together."""
+    from filaseg.postprocess.instances import InstanceConfig, scale_to_disk
+
+    config = InstanceConfig()
+    assert scale_to_disk(config, config.reference_radius).merge_gap == config.merge_gap
+
+    scaled = scale_to_disk(config, 4 * config.reference_radius)
+    assert scaled.merge_gap == pytest.approx(4 * config.merge_gap)
+    # Areas scale with the square.
+    assert scaled.fill_hole_area == pytest.approx(16 * config.fill_hole_area, rel=0.01)
+    assert scaled.max_roundness_area == pytest.approx(
+        16 * config.max_roundness_area, rel=0.01
+    )
+    # min_area is left alone: it already scales through min_area_fraction.
+    assert scaled.min_area == config.min_area
+
+
+def test_instance_scaling_can_be_switched_off():
+    from filaseg.postprocess.instances import InstanceConfig, scale_to_disk
+
+    config = InstanceConfig(scale_with_radius=False)
+    assert scale_to_disk(config, 2000.0).merge_gap == config.merge_gap
+
+
+def test_radius_is_recovered_from_the_disk_mask():
+    from filaseg.postprocess.instances import radius_from_mask
+
+    yy, xx = np.ogrid[:512, :512]
+    valid = ((yy - 256) ** 2 + (xx - 256) ** 2) <= 200**2
+    assert radius_from_mask(valid) == pytest.approx(200.0, rel=0.01)
+    assert radius_from_mask(np.zeros((16, 16), dtype=bool)) == 0.0
+
+
+def test_a_wide_gap_is_bridged_only_at_the_matching_resolution():
+    """The same filament, imaged at two scales, must be rejoined at both."""
+    from filaseg.postprocess.instances import InstanceConfig, extract_instances
+
+    for factor in (1, 4):
+        size = 512 * factor
+        radius = 225 * factor
+        yy, xx = np.ogrid[:size, :size]
+        valid = ((yy - size // 2) ** 2 + (xx - size // 2) ** 2) <= radius**2
+
+        probability = np.zeros((size, size), dtype=np.float32)
+        row = size // 2
+        thickness = 4 * factor
+        # Two collinear fragments separated by a gap of 12 reference pixels.
+        probability[row : row + thickness, 40 * factor : 200 * factor] = 1.0
+        probability[row : row + thickness, 212 * factor : 380 * factor] = 1.0
+
+        labels = extract_instances(probability, valid, InstanceConfig())
+        assert labels.max() == 1, f"not rejoined at {size}px"

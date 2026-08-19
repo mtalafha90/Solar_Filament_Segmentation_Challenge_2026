@@ -150,8 +150,10 @@ Two practical notes:
   lose information, and splits into photometry per *frame* and targets per
   *annotator record* — so the 447 repeated frames in MAGFiLO are preprocessed
   once, not twice. That is about 2.8 GB for the training split.
-- Component-size limits scale with the solar disk, so the same settings work
-  whether the frames are 512 or 2048 pixels across.
+- Every pixel-valued setting scales with the measured solar disk — filter
+  widths, the merge gap, size limits — so one configuration works whether the
+  frames are 512 or 2048 pixels across. These describe properties of the Sun,
+  not of the sensor.
 - Chirality is read from MAGFiLO's `Left` / `Right` categories, not from a
   field of its own.
 - Frames may sit directly in the split directory or nested inside it; both are
@@ -446,7 +448,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-177 tests cover geometry, photometry, annotation parsing and encoding, the loss
+181 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

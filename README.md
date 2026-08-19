@@ -38,6 +38,9 @@ The pipeline addresses each of these directly, and the sections below say how.
 
 ---
 
+> **New here? [`QUICKSTART.md`](QUICKSTART.md) has the exact commands**, from
+> cloning to a submission file, including where to put the dataset.
+
 ## Installation
 
 ```bash

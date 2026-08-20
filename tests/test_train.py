@@ -3,7 +3,9 @@
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
+from conftest import require
+
+torch = require("torch")
 
 from filaseg.metrics import evaluate  # noqa: E402
 from filaseg.models.filanet import FilaNetConfig  # noqa: E402

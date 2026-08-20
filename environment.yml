@@ -36,9 +36,15 @@ dependencies:
 
   - pip
   - pip:
-      # Installs a CUDA build on Linux with an NVIDIA driver present. If it
-      # lands on the CPU-only wheel, reinstall from the index matching your
-      # driver, for example:
-      #   pip install --force-reinstall torch \
+      # Installs a CUDA build on Linux with an NVIDIA driver present.
+      #
+      # Do not add conda's nccl, cudatoolkit or cudnn to this environment. The
+      # wheel bundles its own matched set, and an older conda copy loaded ahead
+      # of them surfaces as an undefined symbol at import, such as
+      # "libtorch_cuda.so: undefined symbol: ncclCommResume".
+      #
+      # If the CPU-only wheel is selected, or the CUDA build will not load,
+      # reinstall the whole set from the index matching your driver:
+      #   pip install --force-reinstall --no-cache-dir torch \
       #       --index-url https://download.pytorch.org/whl/cu124
       - torch>=2.0

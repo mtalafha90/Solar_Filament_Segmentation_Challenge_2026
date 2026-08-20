@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import require
 
 from filaseg.data.coco import load_coco, normalise_id, summarise
 from filaseg.data.dataset import MagfiloDataset
@@ -516,7 +517,7 @@ def test_dataset_reports_zero_observations_rather_than_guessing(tmp_path):
 
 
 def test_challenge_rle_round_trips_losslessly():
-    pytest.importorskip("pycocotools")
+    require("pycocotools")
     from filaseg.submission import coco_rle_counts, decode_coco_rle_counts
 
     rng = np.random.default_rng(0)
@@ -532,7 +533,7 @@ def test_challenge_rle_round_trips_losslessly():
 
 
 def test_challenge_csv_has_the_required_shape(tmp_path):
-    pytest.importorskip("pycocotools")
+    require("pycocotools")
     from filaseg.submission import read_challenge_csv, write_challenge_csv
 
     labels = np.zeros((2048, 2048), dtype=np.int32)
@@ -562,7 +563,7 @@ def test_challenge_csv_has_the_required_shape(tmp_path):
 
 
 def test_challenge_csv_refuses_the_wrong_frame_size(tmp_path):
-    pytest.importorskip("pycocotools")
+    require("pycocotools")
     from filaseg.submission import write_challenge_csv
 
     with pytest.raises(ValueError, match="2048"):
@@ -635,6 +636,7 @@ def test_merging_is_available_but_off_by_default(tmp_path):
 
 def test_split_keeps_one_frame_out_of_both_sides(tmp_path):
     """Otherwise the model validates on an image it trained on."""
+    require("torch")  # split_ids lives in the training module
     from filaseg.train import split_ids
 
     groups = ["a.jpg", "a.jpg", "b.jpg", "c.jpg", "c.jpg", "c.jpg", "d.jpg", "e.jpg"]
@@ -648,6 +650,7 @@ def test_split_keeps_one_frame_out_of_both_sides(tmp_path):
 
 
 def test_split_without_groups_is_unchanged():
+    require("torch")  # split_ids lives in the training module
     from filaseg.train import split_ids
 
     train_idx, val_idx = split_ids(20, 0.15, seed=0)

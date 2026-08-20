@@ -3,7 +3,9 @@
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
+from conftest import require
+
+torch = require("torch")
 
 from filaseg.inference import (  # noqa: E402
     InferenceConfig,

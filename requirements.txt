@@ -13,8 +13,9 @@ astropy>=5.3
 # https://pytorch.org/get-started/locally/
 torch>=2.0
 
-# Optional: only needed for compressed-RLE COCO annotations
-# pycocotools>=2.0.7
+# Required: the competition submission format is pycocotools compressed RLE,
+# and some COCO exports use it for annotations too
+pycocotools>=2.0.7
 
 # Development
 pytest>=7.4

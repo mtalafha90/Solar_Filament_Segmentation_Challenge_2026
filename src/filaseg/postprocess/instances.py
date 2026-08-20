@@ -21,7 +21,7 @@ long filament can look compact on its own.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -33,7 +33,18 @@ class InstanceConfig:
 
     threshold: float = 0.5
     min_area: int = 40
-    """Discard components smaller than this many pixels. Scaled with resolution."""
+    """Absolute floor on component size, in pixels."""
+    min_area_fraction: float = 1.2e-4
+    """Minimum component size as a fraction of the solar disk's area.
+
+    A fixed pixel count cannot serve both a 512-pixel thumbnail and a
+    2048-pixel GONG frame: 40 pixels is a sensible floor on the first and pure
+    noise on the second, where the disk covers 2.6 million pixels and an average
+    filament runs to a few thousand. The effective threshold is therefore the
+    larger of ``min_area`` and this fraction of the disk, whenever the on-disk
+    mask is known. The default corresponds to roughly 310 pixels on a standard
+    GONG frame, well below the smallest annotated filaments.
+    """
     fill_hole_area: int = 64
     """Fill interior holes up to this area; larger voids are probably real."""
     merge_gap: float = 18.0
@@ -56,11 +67,61 @@ class InstanceConfig:
     itself, and leave it off for one that can.
     """
     max_roundness_area: int = 900
-    """Only blobs below this area are eligible for rejection as sunspots."""
+    """Only blobs below this area are eligible for rejection as sunspots.
+
+    Like ``min_area`` this is a pixel count, so raise it in proportion to the
+    disk if you work at a resolution other than the GONG standard.
+    """
     min_axis_ratio: float = 1.7
     """Minimum major/minor axis ratio for a small blob to be kept."""
     closing_radius: int = 0
     """Optional morphological closing applied before labelling."""
+    scale_with_radius: bool = True
+    """Rescale the pixel-valued settings to the solar disk actually measured.
+
+    Every length here describes a property of the Sun, not of the sensor, so all
+    of them follow the plate scale. A gap of 18 pixels is a sensible bridge on a
+    512-pixel thumbnail and a quarter of the true distance on a 2048-pixel GONG
+    frame, where the same filament is four times longer in pixels. Left
+    unscaled, fragments that should be rejoined are left apart, which Panoptic
+    Quality charges as a false positive plus a false negative.
+    """
+    reference_radius: float = 225.0
+    """Solar radius, in pixels, that the pixel-valued settings assume."""
+
+
+def scale_to_disk(config: InstanceConfig, radius: float) -> InstanceConfig:
+    """Rescale the pixel-valued settings to the measured solar radius.
+
+    Lengths scale linearly with the radius and areas with its square.
+    ``min_area`` is left alone because it already scales through
+    ``min_area_fraction``.
+
+    Args:
+        config: Settings quoted for ``reference_radius``.
+        radius: Solar radius on this frame, in pixels.
+
+    Returns:
+        A rescaled copy, or the original when scaling is off or unnecessary.
+    """
+    if not config.scale_with_radius or config.reference_radius <= 0:
+        return config
+    factor = float(radius) / float(config.reference_radius)
+    if not np.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 0.05:
+        return config
+    return replace(
+        config,
+        merge_gap=config.merge_gap * factor,
+        fill_hole_area=int(round(config.fill_hole_area * factor**2)),
+        max_roundness_area=int(round(config.max_roundness_area * factor**2)),
+        closing_radius=int(round(config.closing_radius * factor)),
+    )
+
+
+def radius_from_mask(valid: np.ndarray) -> float:
+    """Solar radius implied by an on-disk mask, from its area."""
+    area = float(np.count_nonzero(valid))
+    return float(np.sqrt(area / np.pi)) if area > 0 else 0.0
 
 
 def _disk_structure(radius: int) -> np.ndarray:
@@ -345,8 +406,15 @@ def extract_instances(
     """
     config = config or InstanceConfig()
     mask = np.asarray(probability) >= config.threshold
+
+    min_area = config.min_area
     if valid is not None:
-        mask = mask & np.asarray(valid, dtype=bool)
+        valid = np.asarray(valid, dtype=bool)
+        mask = mask & valid
+        # Scale every length to the disk, so one set of settings works at any
+        # resolution the data happens to be distributed at.
+        min_area = max(min_area, int(round(config.min_area_fraction * valid.sum())))
+        config = scale_to_disk(config, radius_from_mask(valid))
     if not mask.any():
         return np.zeros(mask.shape, dtype=np.int32)
 
@@ -356,7 +424,7 @@ def extract_instances(
 
     # 8-connectivity, so diagonally touching barb pixels stay with their filament.
     labels, _ = ndi.label(mask, structure=np.ones((3, 3), dtype=int))
-    labels = remove_small(labels, config.min_area)
+    labels = remove_small(labels, min_area)
     if labels.max() == 0:
         return labels.astype(np.int32)
 

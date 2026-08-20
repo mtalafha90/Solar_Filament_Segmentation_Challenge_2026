@@ -16,6 +16,10 @@ together at inference.
 
 from __future__ import annotations
 
+import hashlib
+import warnings
+import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -36,9 +40,17 @@ except ImportError:  # pragma: no cover - exercised only without torch
 
 from ..preprocessing.disk import SolarDisk
 from ..preprocessing.photometry import preprocess
-from .coco import ImageRecord, load_coco, rescale_record
-from .io import find_image, read_image
+from .coco import ImageId, ImageRecord, load_coco, normalise_id, rescale_record
+from .io import read_image, resolve_images
 from .targets import boundary_map, distance_weight, spine_heatmap
+
+# Bumped whenever the cache layout changes, so stale files are simply ignored
+# rather than loaded and misinterpreted.
+CACHE_VERSION = 4
+
+# Upper bound used when quantising the per-pixel loss weights into a byte.
+# distance_weight tops out at base + boundary_gain + thin_gain = 6 by default.
+WEIGHT_MAX = 8.0
 
 
 @dataclass
@@ -54,7 +66,7 @@ class PreparedObservation:
     boundary: np.ndarray  # (H, W) float32
     weight: np.ndarray  # (H, W) float32 per-pixel loss weights
     disk: SolarDisk
-    image_id: int = 0
+    image_id: ImageId = 0
     file_name: str = ""
 
     def input_stack(self) -> np.ndarray:
@@ -73,7 +85,8 @@ def prepare_observation(
     mask: np.ndarray | None = None,
     instances: np.ndarray | None = None,
     spine_points: Sequence[np.ndarray | None] | None = None,
-    disk_fraction: float = 0.995,
+    disk_fraction: float = 0.96,
+    photometry: tuple[np.ndarray, np.ndarray, SolarDisk] | None = None,
 ) -> PreparedObservation:
     """Preprocess an image and build every supervision target from it.
 
@@ -84,11 +97,17 @@ def prepare_observation(
         instances: Explicit instance label map.
         spine_points: Per-instance spine polylines in ``(y, x)`` order.
         disk_fraction: Fraction of the solar radius treated as valid.
+        photometry: Pre-computed ``(processed, valid, disk)``, to skip the
+            preprocessing step. Several annotators may describe one frame, and
+            the photometry is identical for all of them.
 
     Returns:
         A fully populated :class:`PreparedObservation`.
     """
-    processed, valid, disk = preprocess(image, disk_fraction=disk_fraction)
+    if photometry is not None:
+        processed, valid, disk = photometry
+    else:
+        processed, valid, disk = preprocess(image, disk_fraction=disk_fraction)
     radius_map = disk.radial_map(processed.shape)
     mu = np.sqrt(np.clip(1.0 - np.clip(radius_map, 0.0, 1.0) ** 2, 0.0, 1.0))
     mu = (mu * valid).astype(np.float32)
@@ -148,9 +167,13 @@ class MagfiloDataset:
         annotations: str | Path,
         image_dir: str | Path,
         cache_dir: str | Path | None = None,
-        image_ids: Sequence[int] | None = None,
+        image_ids: Sequence[ImageId] | None = None,
+        require_images: bool = True,
+        search_subdirectories: bool = True,
+        merge_duplicate_frames: bool = False,
     ) -> None:
         self.image_dir = Path(image_dir)
+        self.search_subdirectories = bool(search_subdirectories)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -158,43 +181,193 @@ class MagfiloDataset:
         self._warned_about_size = False
         records, self.meta = load_coco(annotations)
         if image_ids is not None:
-            wanted = set(int(i) for i in image_ids)
+            wanted = {normalise_id(i) for i in image_ids}
             records = [r for r in records if r.image_id in wanted]
+
+        # Resolve every image up front. An annotation file routinely covers more
+        # observations than were distributed -- a competition ships one JSON and
+        # splits the frames -- so records without an image are normal and are
+        # dropped. What is never acceptable is two records resolving to the same
+        # file, because the annotations would then be paired with the wrong
+        # frame and nothing downstream could tell.
+        self.resolved: dict[str, Path] = {}
+        self.missing: list[str] = []
+        self.merged: int = 0
+        if require_images:
+            self.resolved, self.missing, collisions = resolve_images(
+                self.image_dir,
+                [record.file_name for record in records],
+                self.search_subdirectories,
+            )
+            if collisions:
+                examples = "\n  ".join(
+                    f"{path.name} <- {', '.join(repr(n) for n in names[:4])}"
+                    for path, names in list(collisions.items())[:5]
+                )
+                raise ValueError(
+                    f"{len(collisions)} image file(s) are referenced by more than one "
+                    f"annotation record under different names. Loading these would "
+                    f"pair masks with the wrong frames, so this is refused rather "
+                    f"than warned about.\n  {examples}\n"
+                    f"Point --image-dir at the directory the names refer to, or "
+                    f"filter the annotation file to one split."
+                )
+            if self.missing:
+                kept = len(records) - len(self.missing)
+                warnings.warn(
+                    f"{len(self.missing)} of {len(records)} annotated observations "
+                    f"have no image under {self.image_dir} and were skipped "
+                    f"(for example {self.missing[0]!r}); {kept} remain. This is "
+                    f"expected when the annotation file covers more frames than "
+                    f"this split contains.",
+                    stacklevel=2,
+                )
+                records = [r for r in records if r.file_name in self.resolved]
+
+            if merge_duplicate_frames:
+                records = self._merge_duplicate_frames(records)
+            else:
+                self._count_repeated_frames(records)
+
         self.records = records
+
+    def _count_repeated_frames(self, records: list[ImageRecord]) -> None:
+        """Note how many frames carry more than one independent annotation.
+
+        MAGFiLO has several annotators label the same observation independently,
+        and the image ids encode which: ``010401-20160920230134Lh`` and
+        ``010402-20160920230134Lh`` are two people's readings of one frame. The
+        organisers state these are to be treated as separate images, and that is
+        what we do -- each is a complete annotation in its own right, not a part
+        of one. Treating them as extra training examples exposes the model to
+        genuine annotator disagreement, which is a fair reflection of how
+        ambiguous a faint filament's extent really is.
+
+        They must not be split across training and validation, though, or the
+        model validates on an image it trained on. :func:`group_key` gives the
+        grouping that prevents that.
+        """
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.file_name] = counts.get(record.file_name, 0) + 1
+        self.merged = 0
+        self.repeated = sum(count - 1 for count in counts.values() if count > 1)
+        if self.repeated:
+            warnings.warn(
+                f"{self.repeated} of {len(records)} records annotate a frame that "
+                f"another record also annotates, by a different annotator. They are "
+                f"kept as separate observations, which is what the challenge "
+                f"specifies; {len(counts)} distinct images are covered. Splits are "
+                f"grouped by image so the same frame cannot appear in both training "
+                f"and validation.",
+                stacklevel=3,
+            )
+
+    def _merge_duplicate_frames(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """Fold records that describe the same frame into one.
+
+        Off by default. Only correct if repeated records hold *parts* of one
+        frame's annotation; in MAGFiLO they are independent complete readings by
+        different annotators, so merging them would union overlapping masks of
+        the same filaments and inflate the filament count.
+        """
+        by_file: OrderedDict[str, ImageRecord] = OrderedDict()
+        duplicates = 0
+        for record in records:
+            existing = by_file.get(record.file_name)
+            if existing is None:
+                by_file[record.file_name] = record
+                continue
+            existing.annotations.extend(record.annotations)
+            existing.height = existing.height or record.height
+            existing.width = existing.width or record.width
+            duplicates += 1
+
+        self.merged = duplicates
+        if duplicates:
+            warnings.warn(
+                f"{duplicates} annotation record(s) described a frame already "
+                f"listed; their filaments were merged into it, leaving "
+                f"{len(by_file)} distinct observations. Keeping them separate "
+                f"would have shown the model real filaments labelled as "
+                f"background.",
+                stacklevel=3,
+            )
+        return list(by_file.values())
 
     def __len__(self) -> int:
         return len(self.records)
 
     @property
-    def image_ids(self) -> list[int]:
+    def image_ids(self) -> list[ImageId]:
         return [record.image_id for record in self.records]
 
-    def _cache_path(self, record: ImageRecord) -> Path | None:
+    @property
+    def group_keys(self) -> list[str]:
+        """The underlying frame each record annotates.
+
+        Records sharing a key are different annotators' readings of one image,
+        so they must land on the same side of a train/validation split.
+        """
+        return [record.file_name for record in self.records]
+
+    @staticmethod
+    def _safe_name(raw: str) -> str:
+        """A filename-safe form of an arbitrary id, with a hash to avoid clashes."""
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)[:80]
+        return f"{safe}_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+
+    def _frame_cache_path(self, record: ImageRecord) -> Path | None:
+        """Cache for the parts that depend only on the image, not the annotator.
+
+        Preprocessing is by far the slowest step, and in MAGFiLO 447 of the 1154
+        records are second and third annotators' readings of a frame already
+        seen. Keying the photometry on the file rather than the record means it
+        is computed once per image instead of once per record, which is a third
+        off the first epoch and a third off the cache on disk.
+        """
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"{record.image_id:07d}.npz"
+        directory = self.cache_dir / "frames"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{self._safe_name(str(record.file_name))}.npz"
+
+    def _cache_path(self, record: ImageRecord) -> Path | None:
+        """Cache file for one observation.
+
+        Image ids are not necessarily integers -- MAGFiLO uses the original GONG
+        frame name -- so the id is sanitised into something safe for a filename
+        and given a short hash suffix, which keeps two ids that sanitise to the
+        same text from colliding.
+        """
+        if self.cache_dir is None:
+            return None
+        directory = self.cache_dir / "targets"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{self._safe_name(str(record.image_id))}.npz"
 
     def __getitem__(self, index: int) -> PreparedObservation:
         record = self.records[index]
         cache_path = self._cache_path(record)
+        frame_path = self._frame_cache_path(record)
+
+        photometry = None
+        if frame_path is not None and frame_path.exists():
+            photometry = self._load_frame_cache(frame_path)
 
         if cache_path is not None and cache_path.exists():
-            with np.load(cache_path) as blob:
-                return PreparedObservation(
-                    image=blob["image"],
-                    valid=blob["valid"].astype(bool),
-                    mu=blob["mu"],
-                    mask=blob["mask"].astype(bool),
-                    instances=blob["instances"],
-                    spine=blob["spine"],
-                    boundary=blob["boundary"],
-                    weight=blob["weight"],
-                    disk=SolarDisk(*[float(v) for v in blob["disk"]]),
-                    image_id=int(blob["image_id"]),
-                    file_name=str(blob["file_name"]),
-                )
+            prepared = self._load_cache(cache_path, photometry)
+            if prepared is not None:
+                return prepared
 
-        image = read_image(find_image(self.image_dir, record.file_name))
+        path = self.resolved.get(record.file_name)
+        if path is None:
+            from .io import find_image
+
+            path = find_image(
+                self.image_dir, record.file_name, self.search_subdirectories
+            )
+        image = read_image(path)
         if record.height == 0 or record.width == 0:
             record.height, record.width = image.shape
         elif (record.height, record.width) != image.shape:
@@ -211,27 +384,151 @@ class MagfiloDataset:
                 )
                 self._warned_about_size = True
             rescale_record(record, image.shape[0], image.shape[1])
-        prepared = prepare_observation(image, record=record)
+        prepared = prepare_observation(image, record=record, photometry=photometry)
 
+        if frame_path is not None and photometry is None:
+            self._save_frame_cache(frame_path, prepared)
         if cache_path is not None:
-            np.savez_compressed(
-                cache_path,
-                image=prepared.image,
-                valid=prepared.valid,
-                mu=prepared.mu,
-                mask=prepared.mask,
-                instances=prepared.instances,
-                spine=prepared.spine,
-                boundary=prepared.boundary,
-                weight=prepared.weight,
-                disk=np.array(
-                    [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
-                    dtype=np.float64,
-                ),
-                image_id=prepared.image_id,
-                file_name=prepared.file_name,
-            )
+            self._save_cache(cache_path, prepared)
         return prepared
+
+    # ------------------------------------------------------------------
+    # Cache
+    #
+    # A full-resolution GONG frame carries eight arrays at 2048x2048. Stored
+    # naively that is ~18 MB per observation, or 12.6 GB for a 700-frame
+    # training set -- enough to matter on a laptop or a shared disk. So we store
+    # only what is expensive to recompute, at the smallest precision that does
+    # not lose information, and rebuild the rest on load:
+    #
+    #   * ``mu`` follows from the disk geometry by arithmetic;
+    #   * ``mask`` is just ``instances > 0``.
+    #
+    # ``boundary`` and ``weight`` are stored rather than recomputed: the
+    # distance transform behind ``weight`` costs 0.8 s on a 2048-pixel frame,
+    # which dwarfs the few hundred kilobytes it takes to keep.
+    #
+    # The image is normalised to [0, 1] and the spine is a [0, 1] heatmap, so
+    # float16 and uint8 are finer than the 8-bit JPEGs they came from. Weights
+    # are quantised over [0, WEIGHT_MAX], well above the values
+    # :func:`~filaseg.data.targets.distance_weight` produces.
+    # ------------------------------------------------------------------
+
+    def _save_frame_cache(self, path: Path, prepared: PreparedObservation) -> None:
+        """Store the photometry, which every annotator's record of this frame shares.
+
+        The prepared image is quantised in place to match what is written. The
+        cache stores float16, so without this the first record of a frame would
+        see full-precision photometry and every later one the quantised version,
+        making results depend on whether the cache happened to be warm. The
+        difference is around 1e-4 and harmless in itself; a result that changes
+        with cache state is not.
+        """
+        prepared.image = prepared.image.astype(np.float16).astype(np.float32)
+        np.savez_compressed(
+            path,
+            version=np.array(CACHE_VERSION),
+            image=prepared.image.astype(np.float16),
+            valid=np.packbits(prepared.valid),
+            shape=np.array(prepared.image.shape, dtype=np.int32),
+            disk=np.array(
+                [prepared.disk.centre_y, prepared.disk.centre_x, prepared.disk.radius],
+                dtype=np.float64,
+            ),
+        )
+
+    def _load_frame_cache(
+        self, path: Path
+    ) -> tuple[np.ndarray, np.ndarray, SolarDisk] | None:
+        """Read cached photometry, or None if it is stale or damaged."""
+        try:
+            with np.load(path) as blob:
+                if int(blob["version"]) != CACHE_VERSION:
+                    return None
+                shape = tuple(int(v) for v in blob["shape"])
+                image = blob["image"].astype(np.float32)
+                valid = (
+                    np.unpackbits(blob["valid"], count=shape[0] * shape[1])
+                    .astype(bool)
+                    .reshape(shape)
+                )
+                disk = SolarDisk(*[float(v) for v in blob["disk"]])
+        except (KeyError, ValueError, OSError, EOFError, zipfile.BadZipFile):
+            return None
+        return image, valid, disk
+
+    def _save_cache(self, path: Path, prepared: PreparedObservation) -> None:
+        """Store only what this annotator's reading contributes.
+
+        The image, validity mask and disk geometry live in the frame cache,
+        shared with every other record of the same observation, so they are not
+        repeated here.
+        """
+        np.savez_compressed(
+            path,
+            version=np.array(CACHE_VERSION),
+            instances=prepared.instances.astype(np.uint16),
+            spine=(np.clip(prepared.spine, 0.0, 1.0) * 255).astype(np.uint8),
+            boundary=np.packbits(prepared.boundary > 0.5),
+            weight=(
+                np.clip(prepared.weight / WEIGHT_MAX, 0.0, 1.0) * 255
+            ).astype(np.uint8),
+            shape=np.array(prepared.image.shape, dtype=np.int32),
+            image_id=str(prepared.image_id),
+            file_name=prepared.file_name,
+        )
+
+    def _load_cache(
+        self, path: Path, photometry: tuple[np.ndarray, np.ndarray, SolarDisk] | None
+    ) -> PreparedObservation | None:
+        """Read a cached observation, or return None if it cannot be used.
+
+        Needs the frame cache too, since the photometry lives there. Any missing
+        or damaged piece simply means recomputing, which is always safe.
+        """
+        if photometry is None:
+            return None
+        image, valid, disk = photometry
+        try:
+            with np.load(path) as blob:
+                if int(blob["version"]) != CACHE_VERSION:
+                    return None
+                shape = tuple(int(v) for v in blob["shape"])
+                if shape != image.shape:
+                    return None
+                count = shape[0] * shape[1]
+                instances = blob["instances"].astype(np.int32)
+                spine = blob["spine"].astype(np.float32) / 255.0
+                boundary = (
+                    np.unpackbits(blob["boundary"], count=count)
+                    .astype(np.float32)
+                    .reshape(shape)
+                )
+                weight = blob["weight"].astype(np.float32) / 255.0 * WEIGHT_MAX
+                image_id = normalise_id(blob["image_id"].item())
+                file_name = str(blob["file_name"])
+        except (KeyError, ValueError, OSError, EOFError, zipfile.BadZipFile):
+            # A cache written by an older version, or a file truncated by an
+            # interrupted run -- an .npz is a zip, so a partial write raises
+            # BadZipFile. Recomputing is always safe, so never let a damaged
+            # cache stop training.
+            return None
+
+        radius_map = disk.radial_map(shape)
+        mu = np.sqrt(np.clip(1.0 - np.clip(radius_map, 0.0, 1.0) ** 2, 0.0, 1.0))
+        return PreparedObservation(
+            image=image,
+            valid=valid,
+            mu=(mu * valid).astype(np.float32),
+            mask=instances > 0,
+            instances=instances,
+            spine=spine,
+            boundary=boundary,
+            weight=weight,
+            disk=disk,
+            image_id=image_id,
+            file_name=file_name,
+        )
 
 
 class FilamentPatchDataset(Dataset):
@@ -246,6 +543,14 @@ class FilamentPatchDataset(Dataset):
             teaches the model to reject sunspots and other dark distractors.
         augment: Apply dihedral and photometric augmentation.
         seed: Seed for reproducible sampling.
+        max_cached: Fixed number of prepared observations to hold in memory.
+            Leave unset to derive it from ``cache_budget_bytes`` instead, which
+            is safer: a count that is comfortable at 512 pixels is eight times
+            the memory at 2048, and the same number multiplies again by the
+            worker count.
+        cache_budget_bytes: Memory the in-memory cache may use, when
+            ``max_cached`` is not given. The count is worked out from the first
+            observation's actual size, so it adapts to the resolution.
     """
 
     def __init__(
@@ -256,6 +561,8 @@ class FilamentPatchDataset(Dataset):
         positive_fraction: float = 0.7,
         augment: bool = True,
         seed: int = 0,
+        max_cached: int | None = None,
+        cache_budget_bytes: int = 1_500_000_000,
     ) -> None:
         if not _TORCH:  # pragma: no cover
             raise ImportError("FilamentPatchDataset needs PyTorch installed")
@@ -265,9 +572,17 @@ class FilamentPatchDataset(Dataset):
         self.positive_fraction = float(positive_fraction)
         self.augment = bool(augment)
         self.seed = int(seed)
+        self.cache_budget_bytes = int(cache_budget_bytes)
+        # Resolved on the first load, once an observation's real size is known.
+        self.max_cached = max(1, int(max_cached)) if max_cached else 0
         self._epoch = 0
-        self._cache: dict[int, PreparedObservation] = {}
-        self._positions: dict[int, np.ndarray] = {}
+        # Least-recently-used, and bounded on purpose. A prepared 2048-pixel
+        # observation is about 110 MB in memory, so holding a 700-frame training
+        # set would need 77 GB. The bound is a memory budget rather than a count
+        # so that it holds at any resolution, and each DataLoader worker keeps
+        # its own cache, so the budget must already account for that.
+        self._cache: OrderedDict[int, PreparedObservation] = OrderedDict()
+        self._positions: OrderedDict[int, np.ndarray] = OrderedDict()
 
     def set_epoch(self, epoch: int) -> None:
         """Change the sampling seed between epochs so crops differ each pass."""
@@ -276,10 +591,33 @@ class FilamentPatchDataset(Dataset):
     def __len__(self) -> int:
         return self.samples_per_epoch
 
+    @staticmethod
+    def _observation_bytes(prepared: PreparedObservation) -> int:
+        return int(
+            sum(
+                getattr(prepared, name).nbytes
+                for name in (
+                    "image", "valid", "mu", "mask",
+                    "instances", "spine", "boundary", "weight",
+                )
+            )
+        )
+
     def _observation(self, index: int) -> PreparedObservation:
-        if index not in self._cache:
-            self._cache[index] = self.source[index]
-        return self._cache[index]
+        if index in self._cache:
+            self._cache.move_to_end(index)
+            return self._cache[index]
+
+        prepared = self.source[index]
+        if not self.max_cached:
+            # Work out how many fit in the budget now the real size is known.
+            size = max(1, self._observation_bytes(prepared))
+            self.max_cached = max(1, self.cache_budget_bytes // size)
+        self._cache[index] = prepared
+        while len(self._cache) > self.max_cached:
+            evicted, _ = self._cache.popitem(last=False)
+            self._positions.pop(evicted, None)
+        return prepared
 
     def _filament_positions(self, index: int, prepared: PreparedObservation) -> np.ndarray:
         if index not in self._positions:

@@ -1,5 +1,16 @@
 # Results
 
+> **Important caveat, added after running on real data.** The synthetic frames
+> used below give filaments about 3.7σ of contrast against the quiet Sun. Real
+> GONG H-alpha observations give roughly **1σ**. That difference is not a
+> detail: it is the difference between the classical detector reaching IoU 0.62
+> and it being unable to exceed **0.083 at any threshold**. Treat the classical
+> figures below as an upper bound that real data does not approach, and the
+> comparison between the two detectors as correspondingly understated in
+> FilaNet's favour. The generator now takes `filament_depth` and
+> `network_amplitude` so harder sets can be produced;
+> `scripts/diagnose_classical.py` measures the ceiling on any dataset.
+
 Every number here comes from the **synthetic** generator in
 `filaseg.data.synthetic`, because the competition data was not available in the
 environment where this work was done. They are not competition scores. Their
@@ -118,6 +129,13 @@ Small-object removal and fragment merging both help or are neutral. Merging
 reduced 59 components to 57 without changing any metric on these frames — the
 synthetic filaments are rarely broken. It matters more on real data, where poor
 seeing genuinely fragments filaments.
+
+> The synthetic figures in this document predate the defaults being retuned for
+> real GONG statistics. Synthetic frames carry 3–7% filament coverage against
+> MAGFiLO's 0.84%, so they were produced with `expected_coverage` around 0.012;
+> the shipped default is now 0.004. On sparse GONG-scale frames the retuned
+> defaults cut the false discovery rate from 0.63 to 0.06 and raised IoU from
+> 0.651 to 0.740.
 
 ## The classical detector's coverage prior
 

@@ -133,6 +133,7 @@ def _make_filament(
     disk_centre: tuple[float, float],
     disk_radius: float,
     rng: np.random.Generator,
+    width_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, int] | None:
     """Generate one filament: its soft intensity profile, mask and spine."""
     centre_y, centre_x = disk_centre
@@ -159,7 +160,7 @@ def _make_filament(
     # Filaments are thicker in the body and taper at both ends.
     n_points = len(spine)
     along = np.linspace(0.0, 1.0, n_points)
-    base_half_width = rng.uniform(2.5, 9.0)
+    base_half_width = rng.uniform(2.5, 9.0) * width_scale
     taper = np.sin(np.pi * np.clip(along, 0.0, 1.0)) ** 0.35
     wobble = 1.0 + 0.25 * ndi.gaussian_filter1d(
         rng.standard_normal(n_points).astype(np.float32), max(1.0, n_points / 6.0)
@@ -194,11 +195,13 @@ def _make_filament(
             dtype=np.float32,
         )
         direction = rot @ tangent
-        barb_length = rng.uniform(6.0, 28.0)
+        barb_length = rng.uniform(6.0, 28.0) * width_scale
         n_barb_points = max(3, int(barb_length / 1.5))
         offsets = np.linspace(0.0, barb_length, n_barb_points)[:, None]
         barb_points = spine[anchor][None, :] + offsets * direction[None, :]
-        barb_widths = np.linspace(max(1.6, base_half_width * 0.45), 0.9, n_barb_points)
+        barb_widths = np.linspace(
+            max(1.6 * width_scale, base_half_width * 0.45), 0.9 * width_scale, n_barb_points
+        )
         _stamp_path(canvas, barb_points, barb_widths)
 
     mask = canvas > 0.22
@@ -214,6 +217,11 @@ def generate_observation(
     solar_radius_fraction: float = 0.88,
     seed: int | None = None,
     noise_level: float = 0.012,
+    filament_depth: tuple[float, float] = (0.30, 0.62),
+    network_amplitude: float = 0.05,
+    plage_amplitude: float = 0.07,
+    width_scale: float = 1.0,
+    limb_rim: float = 0.0,
 ) -> SyntheticObservation:
     """Generate one synthetic full-disk H-alpha observation with ground truth.
 
@@ -226,6 +234,20 @@ def generate_observation(
             side.  GONG frames sit at roughly 900/1024.
         seed: Seed for reproducibility.
         noise_level: Standard deviation of the additive detector noise.
+        filament_depth: Range of fractional darkening a filament imposes. The
+            default is generous; real H-alpha filaments are often far shallower,
+            which is what makes them hard, so lower this to make a harder set.
+        network_amplitude: Strength of the chromospheric network mottling, the
+            main texture a detector has to see past.
+        plage_amplitude: Strength of the bright plage patches.
+        width_scale: Multiplies filament widths, for generating at a different
+            resolution while keeping the apparent shape.
+        limb_rim: Strength of a bright ring just inside the limb, standing in
+            for the chromospheric emission and spicules that real H-alpha shows
+            there. This is the single most destructive artefact for a detector
+            that keys on local intensity: after limb-darkening is divided out,
+            the rim survives as an enormous positive residual and dominates the
+            score map unless the outer annulus is excluded.
 
     Returns:
         A :class:`SyntheticObservation`.
@@ -244,17 +266,17 @@ def generate_observation(
     image = _limb_darkening(radius_map, u=rng.uniform(0.6, 0.85)).astype(np.float32)
 
     # Chromospheric network: fine bright/dark mottling across the disk.
-    image *= 1.0 + 0.05 * _smooth_noise(shape, max(1.0, size / 256.0), rng)
+    image *= 1.0 + network_amplitude * _smooth_noise(shape, max(1.0, size / 256.0), rng)
     # Plage: larger bright patches.
     plage = _smooth_noise(shape, max(2.0, size / 40.0), rng)
-    image *= 1.0 + 0.07 * np.clip(plage, 0.0, None)
+    image *= 1.0 + plage_amplitude * np.clip(plage, 0.0, None)
 
     # Filaments, drawn dark against the disk.
     filaments: list[SyntheticFilament] = []
     attempts = 0
     while len(filaments) < n_filaments and attempts < n_filaments * 6:
         attempts += 1
-        made = _make_filament(shape, (centre_y, centre_x), radius, rng)
+        made = _make_filament(shape, (centre_y, centre_x), radius, rng, width_scale)
         if made is None:
             continue
         profile, mask, chirality = made
@@ -263,7 +285,7 @@ def generate_observation(
         # Overlapping filaments would be ambiguous ground truth, so skip them.
         if any((mask & existing.mask).any() for existing in filaments):
             continue
-        depth = rng.uniform(0.30, 0.62)
+        depth = rng.uniform(*filament_depth)
         image *= 1.0 - depth * profile
         spine_points = np.argwhere(
             ndi.binary_erosion(mask, np.ones((3, 3), dtype=bool), iterations=1)
@@ -287,6 +309,11 @@ def generate_observation(
         dist = np.hypot(yy - spot_y, xx - spot_x)
         umbra = np.clip(1.0 - (dist / spot_radius) ** 2, 0.0, 1.0) ** 0.6
         image *= 1.0 - rng.uniform(0.35, 0.7) * umbra
+
+    # A bright chromospheric rim just inside the limb, as real H-alpha shows.
+    if limb_rim > 0:
+        rim = np.exp(-(((radius_map - 0.985) / 0.012) ** 2))
+        image *= 1.0 + limb_rim * rim
 
     # Ground-based effects: a smooth transmission gradient, then noise.
     image *= 1.0 + 0.10 * _smooth_noise(shape, size / 6.0, rng)

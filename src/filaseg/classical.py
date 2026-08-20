@@ -23,14 +23,14 @@ are connected to a confident core, while equally faint noise elsewhere is not.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from scipy import ndimage as ndi
 
 from .postprocess.instances import InstanceConfig, extract_instances
 from .preprocessing.disk import SolarDisk
-from .preprocessing.photometry import preprocess
+from .preprocessing.photometry import preprocess, smooth_background
 
 
 @dataclass
@@ -38,7 +38,18 @@ class ClassicalConfig:
     """Settings for :func:`detect`."""
 
     scales: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0)
-    """Ridge filter widths in pixels, covering thin barbs to fat filament bodies."""
+    """Ridge filter widths in pixels, covering thin barbs to fat filament bodies.
+
+    Quoted for a disk of ``reference_radius``. Unless ``scale_with_radius`` is
+    turned off these are rescaled to the disk actually measured, because a
+    filament's width in pixels depends entirely on the plate scale: the same
+    structure spans four times as many pixels on a 2048-pixel GONG frame as on a
+    512-pixel thumbnail, and a filter tuned for one is blind to the other.
+    """
+    scale_with_radius: bool = True
+    """Rescale ``scales`` and ``background_scale`` to the measured solar radius."""
+    reference_radius: float = 225.0
+    """Solar radius, in pixels, that ``scales`` and ``background_scale`` assume."""
     ridge_weight: float = 0.3
     """Blend between the ridge response (1.0) and the plain intensity deficit (0.0).
 
@@ -49,7 +60,7 @@ class ClassicalConfig:
     before drawing conclusions -- real sunspot groups are far more irregular
     than the synthetic ones, so the ridge term is expected to matter more.
     """
-    expected_coverage: float = 0.012
+    expected_coverage: float = 0.004
     """Fraction of the solar disk expected to be covered by filament *cores*.
 
     This is the detector's one real assumption, and it is stated in physical
@@ -59,11 +70,15 @@ class ClassicalConfig:
     Final coverage is larger than this number -- see ``growth_factor``.
 
     It genuinely matters, because filament coverage varies by an order of
-    magnitude over the solar cycle: seeding 1.2% of the disk when filaments
-    actually cover 5% caps recall no matter how good the score map is.  The
-    default suits a moderately active Sun.  Measure it from the training
-    annotations instead of guessing -- ``scripts/tune_classical.py`` prints the
-    observed coverage and searches around it.
+    magnitude over the solar cycle, and seeding the wrong fraction caps either
+    recall or precision no matter how good the score map is.
+
+    The default is set for real GONG data: filaments cover about 0.84% of the
+    disk across MAGFiLO, and cores are a fraction of that again. Synthetic
+    frames from :mod:`filaseg.data.synthetic` are far denser and want a value
+    several times higher. Measure it rather than guessing --
+    ``scripts/inspect_data.py`` reports the observed coverage and
+    ``scripts/tune_classical.py`` searches around it.
     """
     growth_factor: float = 4.0
     """How far hysteresis may grow beyond the seeds, as a multiple of coverage.
@@ -91,35 +106,81 @@ class ClassicalConfig:
     """
 
 
-def ridge_response(image: np.ndarray, scales: tuple[float, ...]) -> np.ndarray:
-    """Multi-scale ridge strength for bright elongated structures.
+def _hessian_ridge(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Ridge strength at one scale, from the Hessian eigenvalues.
 
-    At each scale we take the Hessian's eigenvalues.  A ridge has one large
-    negative eigenvalue across its width and one near zero along its length; a
-    blob has two large negative eigenvalues.  Scoring the difference therefore
-    rewards elongation and suppresses round features such as sunspots.
+    A ridge has one large negative eigenvalue across its width and one near zero
+    along its length; a blob has two large negative ones. Scoring the difference
+    therefore rewards elongation and suppresses round features such as sunspots.
+
+    Responses are normalised by ``sigma**2`` so that scales are comparable, which
+    is what lets one threshold serve thin barbs and fat filament bodies alike.
+    """
+    dyy = ndi.gaussian_filter(image, sigma, order=(2, 0), mode="nearest") * sigma**2
+    dxx = ndi.gaussian_filter(image, sigma, order=(0, 2), mode="nearest") * sigma**2
+    dxy = ndi.gaussian_filter(image, sigma, order=(1, 1), mode="nearest") * sigma**2
+
+    trace = dyy + dxx
+    difference = dyy - dxx
+    root = np.sqrt(np.maximum(difference**2 + 4.0 * dxy**2, 0.0))
+    lambda1 = 0.5 * (trace + root)  # larger eigenvalue
+    lambda2 = 0.5 * (trace - root)  # smaller (most negative) eigenvalue
+
+    # A bright ridge: lambda2 strongly negative, lambda1 near zero.
+    response = np.maximum(-lambda2, 0.0) - np.maximum(np.abs(lambda1), 0.0)
+    return np.maximum(response, 0.0)
+
+
+def ridge_response(
+    image: np.ndarray,
+    scales: tuple[float, ...],
+    max_direct_sigma: float = 12.0,
+) -> np.ndarray:
+    """Multi-scale ridge strength for bright elongated structures.
 
     The image is expected to have filaments *bright*, which is what the
     preprocessing chain produces.
+
+    Scales wider than ``max_direct_sigma`` are evaluated on a decimated grid and
+    interpolated back. The sigma-squared normalisation makes the response
+    scale-covariant, so halving the grid and halving sigma gives nearly the same
+    answer.
+
+    The default leaves the shipped scales exact, deliberately. Unlike the smooth
+    background estimates -- where decimation is free, costing a relative error of
+    3e-4 -- decimating the ridge filter measurably moves the detections: at a
+    threshold of 3 pixels the predicted masks agreed with the exact ones at only
+    0.97 IoU, and clDice fell by 0.011, for a 27% saving. Lower it if you need
+    the speed and can afford that, but measure the effect on your data first.
+
+    Args:
+        image: Preprocessed image, filaments bright.
+        scales: Ridge filter widths in pixels.
+        max_direct_sigma: Widths above this are computed decimated. The default
+            keeps every shipped scale exact.
     """
     best = np.zeros(image.shape, dtype=np.float32)
     for sigma in scales:
-        # Second derivatives of the Gaussian-smoothed image, taken in a single
-        # pass. Scaling by sigma^2 makes responses comparable across scales,
-        # which is what lets a single threshold serve thin barbs and fat bodies.
-        dyy = ndi.gaussian_filter(image, sigma, order=(2, 0), mode="nearest") * sigma**2
-        dxx = ndi.gaussian_filter(image, sigma, order=(0, 2), mode="nearest") * sigma**2
-        dxy = ndi.gaussian_filter(image, sigma, order=(1, 1), mode="nearest") * sigma**2
+        factor = 1
+        if sigma > max_direct_sigma:
+            factor = max(1, int(sigma // max_direct_sigma))
 
-        trace = dyy + dxx
-        difference = dyy - dxx
-        root = np.sqrt(np.maximum(difference**2 + 4.0 * dxy**2, 0.0))
-        lambda1 = 0.5 * (trace + root)  # larger eigenvalue
-        lambda2 = 0.5 * (trace - root)  # smaller (most negative) eigenvalue
+        if factor > 1:
+            from skimage.measure import block_reduce
 
-        # A bright ridge: lambda2 strongly negative, lambda1 near zero.
-        response = np.maximum(-lambda2, 0.0) - np.maximum(np.abs(lambda1), 0.0)
-        np.maximum(best, np.maximum(response, 0.0), out=best)
+            small = block_reduce(image, (factor, factor), np.mean)
+            response = _hessian_ridge(small, sigma / factor)
+            response = ndi.zoom(
+                response,
+                (image.shape[0] / response.shape[0], image.shape[1] / response.shape[1]),
+                order=1,
+                mode="nearest",
+            )
+            response = response[: image.shape[0], : image.shape[1]]
+        else:
+            response = _hessian_ridge(image, sigma)
+
+        np.maximum(best, response.astype(np.float32), out=best)
     return best
 
 
@@ -133,10 +194,7 @@ def intensity_deficit(
     off-disk region does not bleed in near the limb.
     """
     weights = valid.astype(np.float32)
-    filled = image * weights
-    smoothed = ndi.gaussian_filter(filled, scale, mode="nearest")
-    norm = ndi.gaussian_filter(weights, scale, mode="nearest")
-    background = smoothed / np.maximum(norm, 1e-6)
+    background = smooth_background(image * weights, weights, scale)
     return np.maximum(image - background, 0.0).astype(np.float32)
 
 
@@ -205,6 +263,34 @@ def _rank_normalise(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return out
 
 
+def scale_to_disk(config: ClassicalConfig, radius: float) -> ClassicalConfig:
+    """Rescale the filter widths to the disk actually measured.
+
+    Filament widths are a property of the Sun, not of the sensor, so every
+    length in the detector has to follow the plate scale. Without this, the
+    defaults silently stop working the moment the data is distributed at a
+    different resolution from the one they were tuned at.
+
+    Args:
+        config: Settings whose lengths are quoted for ``reference_radius``.
+        radius: Solar radius measured on this frame, in pixels.
+
+    Returns:
+        A copy with ``scales`` and ``background_scale`` rescaled, or the
+        original when ``scale_with_radius`` is off.
+    """
+    if not config.scale_with_radius or config.reference_radius <= 0:
+        return config
+    factor = float(radius) / float(config.reference_radius)
+    if not np.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 0.05:
+        return config
+    return replace(
+        config,
+        scales=tuple(float(s) * factor for s in config.scales),
+        background_scale=float(config.background_scale) * factor,
+    )
+
+
 def choose_thresholds(
     inside: np.ndarray, config: ClassicalConfig | None = None
 ) -> tuple[float, float]:
@@ -269,7 +355,8 @@ def detect(
         ``return_score`` is set.
     """
     config = config or ClassicalConfig()
-    processed, valid, _ = preprocess(image, disk=disk)
+    processed, valid, fitted = preprocess(image, disk=disk)
+    config = scale_to_disk(config, fitted.radius)
 
     score = score_map(processed, valid, config)
     inside = score[valid]

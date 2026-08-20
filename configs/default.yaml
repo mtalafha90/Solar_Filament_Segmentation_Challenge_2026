@@ -18,8 +18,11 @@ seed: 0
 # Filaments cover well under one per cent of the disk, so most crops are centred
 # on an annotated filament. The remaining 30% are drawn uniformly and are what
 # teach the model to reject sunspots and plage.
-patch_size: 256
-batch_size: 8
+# 512 suits full-resolution GONG frames, whose solar radius is about 900 px.
+# Never downsample the frame to fit the network: barbs are a few pixels wide and
+# do not survive it.
+patch_size: 512
+batch_size: 4
 samples_per_epoch: 2000
 positive_fraction: 0.7
 num_workers: 4
@@ -32,14 +35,29 @@ warmup_epochs: 2
 grad_clip: 1.0
 amp: true
 
-# Weight on the positive class inside the cross-entropy term. Raise it if the
-# model under-segments, lower it if it floods the disk.
-pos_weight: 4.0
+# Weight on the positive class inside the cross-entropy term. Filaments cover
+# about 0.75% of the disk in MAGFiLO, which is a harsh imbalance, so this is set
+# from that. scripts/inspect_data.py suggests a value from your own data: raise
+# it if the model under-segments, lower it if it floods the disk.
+pos_weight: 11.6
 
-# Validation runs on whole disks, and the best threshold is stored alongside the
-# checkpoint so that prediction needs no manual calibration.
+# Validation runs on whole disks with the same post-processing a submission
+# would use, and the best threshold is stored alongside the checkpoint so that
+# prediction needs no manual calibration.
+#
+# It is the slowest thing in an epoch: whole-disk inference plus metrics at full
+# resolution, roughly ten seconds a frame. If it dominates your epoch time, turn
+# these three, in this order: raise val_every, lower val_max_images, lower
+# instance_thresholds.
 val_every: 1
-val_tile: 512
+val_tile: 512          # whole-disk validation is tiled at this size
+val_max_images: 32     # cap on frames scored per epoch
+instance_thresholds: 2 # thresholds the costly instance metrics run at
+
+# Memory the in-memory observation cache may use, shared across DataLoader
+# workers. A prepared 2048-pixel frame is about 110 MB, so a plain count would
+# mean something quite different at each resolution.
+cache_budget_gb: 3.0
 
 model:
   in_channels: 2           # flattened intensity + heliocentric-angle geometry

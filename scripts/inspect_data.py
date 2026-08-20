@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -25,43 +26,16 @@ import _bootstrap  # noqa: F401
 
 import numpy as np
 
-from filaseg.data.coco import CHIRALITY_NAMES, load_coco, rescale_record, summarise
-from filaseg.data.io import FITS_SUFFIXES, IMAGE_SUFFIXES, find_image, read_image
-from filaseg.preprocessing.photometry import preprocess
-
-SUFFIXES = FITS_SUFFIXES | IMAGE_SUFFIXES | {".npy"}
+from filaseg.data.coco import load_coco, summarise
+from filaseg.data.dataset import MagfiloDataset
+from filaseg.data.io import read_image, resolve_images
+from filaseg.data.layout import count_images, discover, resolve_annotations
 
 
 def find_layout(data_dir: Path) -> tuple[Path | None, Path | None, Path | None]:
-    """Work out where the annotations, training images and test images live.
-
-    Handles the usual competition layout of ``data/train`` plus ``data/test``,
-    with the annotation JSON anywhere inside the training folder.
-    """
-    train_dir = next(
-        (d for d in (data_dir / "train", data_dir / "training", data_dir) if d.is_dir()),
-        None,
-    )
-    test_dir = next(
-        (d for d in (data_dir / "test", data_dir / "testing") if d.is_dir()), None
-    )
-
-    annotations = None
-    for candidate_dir in [d for d in (train_dir, data_dir) if d is not None]:
-        candidates = sorted(candidate_dir.glob("*.json")) + sorted(
-            candidate_dir.glob("*/*.json")
-        )
-        if candidates:
-            # Prefer the largest, which is almost always the real annotation file.
-            annotations = max(candidates, key=lambda p: p.stat().st_size)
-            break
-    return annotations, train_dir, test_dir
-
-
-def count_images(directory: Path | None) -> list[Path]:
-    if directory is None or not directory.is_dir():
-        return []
-    return sorted(p for p in directory.rglob("*") if p.suffix.lower() in SUFFIXES)
+    """Locate the annotations, training images and test images."""
+    layout = discover(data_dir)
+    return layout.annotations, layout.train_dir, layout.test_dir
 
 
 def main() -> None:
@@ -97,10 +71,10 @@ def main() -> None:
         extensions = Counter(p.suffix.lower() for p in train_images)
         print(f"  formats: {dict(extensions)}")
 
-    if annotations is None or not Path(annotations).exists():
-        raise SystemExit(
-            "\nNo annotation JSON found. Pass --annotations explicitly."
-        )
+    try:
+        annotations = resolve_annotations(annotations, image_dir, args.data_dir)
+    except FileNotFoundError as error:
+        raise SystemExit(f"\n{error}") from error
 
     records, meta = load_coco(annotations)
     stats = summarise(records)
@@ -115,36 +89,89 @@ def main() -> None:
         print(f"  {key:28s} {value}")
     print(f"  chirality: {stats['chirality']}")
 
-    # Check every referenced image resolves, and that sizes agree.
+    # Check that every referenced image resolves, that no two records claim the
+    # same file, and that images and annotations agree on size.
     print("\n" + "=" * 66)
     print("INTEGRITY")
     print("=" * 66)
-    missing: list[str] = []
+
+    resolved, missing, collisions = resolve_images(
+        image_dir, [record.file_name for record in records]
+    )
+
+    distinct_names = {record.file_name for record in records}
+    print(f"  annotation records           {len(records)}")
+    print(f"  distinct file names in them  {len(distinct_names)}")
+    print(f"  image files on disk          {len(train_images)}")
+    print(f"  file names resolved          {len(resolved)}")
+    print(f"  file names with no image     {len(missing)}")
+    for name in missing[:3]:
+        print(f"    - {name}")
+    if len(missing) > 3:
+        print(f"    ... and {len(missing) - 3} more")
+
+    if len(records) > len(distinct_names):
+        repeats = len(records) - len(distinct_names)
+        print(f"\n  {repeats} record(s) annotate a frame that another record also")
+        print("  annotates -- MAGFiLO has several annotators label the same")
+        print("  observation independently. They are kept as separate training")
+        print("  examples, which is what the challenge specifies, and splits are")
+        print("  grouped by frame so one image cannot appear on both sides.")
+
+    if missing and resolved:
+        print("\n  Records with no image are normal: the annotation file covers")
+        print("  more observations than this split contains. They are skipped.")
+
+    # If almost nothing resolved, the names on disk differ from the names in the
+    # annotations. Show both, so the mismatch is obvious rather than a mystery.
+    if distinct_names and len(resolved) < 0.5 * len(distinct_names):
+        print("\n  MOST FILE NAMES DID NOT RESOLVE. Compare them:")
+        print("    annotations say : "
+              + ", ".join(sorted(distinct_names)[:3]))
+        print("    on disk         : "
+              + ", ".join(p.name for p in train_images[:3]))
+        directories = sorted({p.parent for p in train_images})[:3]
+        print("    images found in : "
+              + ", ".join(str(d) for d in directories))
+        print("  Point --image-dir at the directory holding the images.")
+
+    if collisions:
+        print(f"\n  ERROR: {len(collisions)} image file(s) are claimed by more than")
+        print("  one record. Annotations would be paired with the wrong frame.")
+        for path, names in list(collisions.items())[:3]:
+            print(f"    - {path.name} <- {', '.join(names[:3])}")
+    else:
+        print("  no two records resolve to the same file")
+
     mismatched: list[tuple[str, tuple, tuple]] = []
     shapes: Counter = Counter()
-
+    unreadable: list[str] = []
+    sampled = 0
+    seen_paths: set[Path] = set()
     for record in records:
-        try:
-            path = find_image(image_dir, record.file_name)
-        except FileNotFoundError:
-            missing.append(record.file_name)
+        if sampled >= args.sample:
+            break
+        path = resolved.get(record.file_name)
+        if path is None or path in seen_paths:
             continue
-        if len(shapes) < args.sample or record is records[-1]:
-            try:
-                image = read_image(path)
-            except Exception as error:  # noqa: BLE001 - report, do not crash
-                missing.append(f"{record.file_name} (unreadable: {error})")
-                continue
-            shapes[image.shape] += 1
-            if (record.height, record.width) not in ((0, 0), image.shape):
-                mismatched.append(
-                    (record.file_name, (record.height, record.width), image.shape)
-                )
+        seen_paths.add(path)
+        sampled += 1
+        try:
+            image = read_image(path)
+        except Exception as error:  # noqa: BLE001 - report, do not crash
+            unreadable.append(f"{record.file_name} ({error})")
+            continue
+        shapes[image.shape] += 1
+        if (record.height, record.width) not in ((0, 0), image.shape):
+            mismatched.append(
+                (record.file_name, (record.height, record.width), image.shape)
+            )
 
-    print(f"  images referenced but not found: {len(missing)}")
-    for name in missing[:5]:
-        print(f"    - {name}")
-    print(f"  image shapes seen: {dict(shapes)}")
+    print(f"\n  image shapes, from {sampled} sampled: {dict(shapes)}")
+    if unreadable:
+        print(f"  unreadable images: {len(unreadable)}")
+        for name in unreadable[:3]:
+            print(f"    - {name}")
     if mismatched:
         print(f"\n  WARNING: {len(mismatched)} size mismatch(es) between annotations "
               f"and images.")
@@ -155,36 +182,55 @@ def main() -> None:
     else:
         print("  annotation and image sizes agree")
 
-    # Preprocess a sample to measure the statistics that drive configuration.
+    # Measure through the dataset itself, so the numbers describe exactly what
+    # training will see: duplicate frames merged, records without images
+    # dropped, annotations clipped to the disk.
     print("\n" + "=" * 66)
-    print("MEASUREMENTS (from a sample of observations)")
+    print("MEASUREMENTS (as the training pipeline will see them)")
     print("=" * 66)
+
     coverage: list[float] = []
     radii: list[float] = []
     counts: list[int] = []
-    sample = records[: max(1, args.sample)]
+    n_observations = 0
 
-    for record in sample:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         try:
-            image = read_image(find_image(image_dir, record.file_name))
-        except FileNotFoundError:
-            continue
-        if (record.height, record.width) != image.shape:
-            rescale_record(record, image.shape[0], image.shape[1])
-        _, valid, disk = preprocess(image)
-        mask = record.semantic_mask() & valid
-        coverage.append(float(mask.sum() / max(valid.sum(), 1)))
-        radii.append(disk.radius)
-        counts.append(len(record.annotations))
+            dataset = MagfiloDataset(annotations, image_dir)
+        except ValueError as error:
+            raise SystemExit(f"\n{error}") from error
+
+    n_observations = len(dataset)
+    print(f"  usable observations     {n_observations}")
+    print(f"  measured on             {min(n_observations, max(1, args.sample))} "
+          f"sampled observation(s)")
+    if n_observations == 0:
+        raise SystemExit(
+            "\nNo observation could be loaded. Check that --image-dir points at "
+            "the images these annotations describe."
+        )
+
+    for index in range(min(n_observations, max(1, args.sample))):
+        prepared = dataset[index]
+        coverage.append(float(prepared.mask.sum() / max(prepared.valid.sum(), 1)))
+        radii.append(prepared.disk.radius)
+        # Count distinct labels, not the largest: clipping to the disk can
+        # remove an instance entirely and leave a gap in the numbering.
+        counts.append(int(np.count_nonzero(np.unique(prepared.instances))))
 
     report: dict = {
+        "n_records": len(records),
+        "n_distinct_file_names": len(distinct_names),
+        "n_records_resolved": len(resolved),
+        "n_records_without_image": len(missing),
+        "n_collisions": len(collisions),
         "annotations": str(annotations),
         "image_dir": str(image_dir),
         "test_dir": str(test_dir) if test_dir else None,
         "n_train_images": len(train_images),
         "n_test_images": len(test_images),
         "image_shapes": {str(k): v for k, v in shapes.items()},
-        "n_missing_images": len(missing),
         "n_size_mismatches": len(mismatched),
         **{k: v for k, v in stats.items() if k != "chirality"},
         "chirality": stats["chirality"],
@@ -231,6 +277,10 @@ def main() -> None:
         radius = float(np.mean(radii))
         tile = 512 if radius > 700 else 256
         print(f"  network            : patch_size = {tile}, val_tile = {tile}")
+        disk_area = np.pi * radius**2
+        print(f"  post-processing    : min_area resolves to "
+              f"{max(40, int(round(1.2e-4 * disk_area)))} px at this resolution")
+        report["suggested_min_area"] = max(40, int(round(1.2e-4 * disk_area)))
         report["suggested_expected_coverage"] = centre
         report["suggested_coverage_range"] = [low, high]
         report["suggested_pos_weight"] = pos_weight

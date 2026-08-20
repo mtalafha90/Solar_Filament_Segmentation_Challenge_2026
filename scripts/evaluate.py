@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Score predictions against ground-truth annotations.
 
-Reports every metric the challenge uses: pixel IoU, precision, recall, clDice,
-multi-scale IoU, hit and miss rates, and AP at several IoU thresholds.
+Reports what the challenge ranks on -- Panoptic Quality and the mean Dice score
+-- alongside the fragmentation and over-merging counts it penalises, the pixel
+metrics, and the end-to-end time per frame, which is also assessed.
 
 Example::
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import _bootstrap  # noqa: F401
@@ -22,6 +24,7 @@ import numpy as np
 
 from filaseg.classical import detect
 from filaseg.data.dataset import MagfiloDataset
+from filaseg.data.layout import discover, resolve_annotations
 from filaseg.metrics import aggregate, evaluate
 from filaseg.postprocess.instances import InstanceConfig, extract_instances
 
@@ -29,8 +32,11 @@ from filaseg.postprocess.instances import InstanceConfig, extract_instances
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--annotations", type=Path, required=True)
-    parser.add_argument("--image-dir", type=Path, required=True, dest="image_dir")
+    parser.add_argument("--data-dir", type=Path, dest="data_dir",
+                        help="dataset root; annotations and images found inside")
+    parser.add_argument("--annotations", type=Path,
+                        help="annotation JSON; discovered automatically if omitted")
+    parser.add_argument("--image-dir", type=Path, dest="image_dir")
     parser.add_argument("--cache-dir", type=Path, dest="cache_dir")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--classical", action="store_true")
@@ -45,6 +51,17 @@ def main() -> None:
 
     if not args.classical and args.checkpoint is None:
         raise SystemExit("give --checkpoint, or --classical for the training-free detector")
+
+    if args.data_dir and not args.image_dir:
+        args.image_dir = discover(args.data_dir).train_dir
+    if args.image_dir is None:
+        raise SystemExit("--image-dir is required (or pass --data-dir)")
+    try:
+        args.annotations = resolve_annotations(
+            args.annotations, args.image_dir, args.data_dir
+        )
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from error
 
     dataset = MagfiloDataset(args.annotations, args.image_dir, args.cache_dir)
     indices = range(min(len(dataset), args.limit) if args.limit else len(dataset))
@@ -69,8 +86,13 @@ def main() -> None:
     instance_config = InstanceConfig(threshold=threshold, min_area=args.min_area)
 
     per_image: list[dict] = []
+    inference_seconds = 0.0
+    started = time.time()
     for position, index in enumerate(indices, start=1):
         prepared = dataset[index]
+        # Timed separately from scoring: the challenge assesses the pipeline's
+        # speed, not the evaluator's.
+        inference_started = time.time()
         if args.classical:
             raw = read_image(find_image(args.image_dir, prepared.file_name))
             labels = detect(raw)
@@ -78,6 +100,7 @@ def main() -> None:
             probability = predict_probability(model, prepared.input_stack(), inference_config)
             labels = extract_instances(probability * prepared.valid, prepared.valid,
                                        instance_config)
+        inference_seconds += time.time() - inference_started
 
         # Ground-truth instances come straight from the annotations.
         scores = evaluate(labels, prepared.instances, prepared.valid)
@@ -86,17 +109,49 @@ def main() -> None:
         if position % 10 == 0 or position == len(list(indices)):
             print(f"  {position} done", flush=True)
 
+    elapsed = time.time() - started
+    count = max(len(per_image), 1)
     summary = aggregate([{k: v for k, v in r.items() if k != "image_id"} for r in per_image])
+    summary["inference_seconds_per_image"] = inference_seconds / count
+    summary["total_seconds_per_image"] = elapsed / count
+
+    groups = [
+        ("RANKED ON", ["pq", "dice"]),
+        ("PANOPTIC BREAKDOWN", ["sq", "rq", "pq_tp", "pq_fp", "pq_fn"]),
+        ("FRAGMENTATION AND OVER-MERGING",
+         ["one_to_one", "one_to_many", "many_to_one", "missed", "spurious",
+          "fragments_per_split"]),
+        ("PIXEL OVERLAP",
+         ["iou", "precision", "recall", "f1", "cl_dice", "msiou"]),
+        ("DETECTION",
+         ["hit_rate", "miss_rate", "false_discovery_rate", "mean_pairwise_iou",
+          "AP@0.25", "AP@0.50", "AP@0.75", "mAP"]),
+        ("COUNTS", ["n_predicted", "n_truth", "n_matched", "n_images"]),
+        ("EFFICIENCY", ["inference_seconds_per_image", "total_seconds_per_image"]),
+    ]
     print("\n" + "=" * 58)
     print("RESULTS")
     print("=" * 58)
-    order = ["iou", "dice", "precision", "recall", "f1", "cl_dice", "msiou",
-             "hit_rate", "miss_rate", "false_discovery_rate", "mean_pairwise_iou",
-             "AP@0.25", "AP@0.50", "AP@0.75", "mAP",
-             "n_predicted", "n_truth", "n_matched", "n_images"]
-    for key in order:
-        if key in summary:
-            print(f"  {key:22s} {summary[key]:.4f}")
+    print("  (inference time is what the challenge assesses; the total also "
+          "includes scoring)")
+    for title, keys in groups:
+        present = [k for k in keys if k in summary]
+        if not present:
+            continue
+        print(f"\n  {title}")
+        for key in present:
+            print(f"    {key:24s} {summary[key]:.4f}")
+
+    # Distributions, which the challenge asks for explicitly.
+    if per_image:
+        print("\n  DISTRIBUTIONS across observations")
+        for key in ("dice", "iou", "pq"):
+            values = np.array([r[key] for r in per_image if key in r])
+            if values.size:
+                quartiles = np.percentile(values, [25, 50, 75])
+                print(f"    {key:8s} min {values.min():.3f}  "
+                      f"q1 {quartiles[0]:.3f}  median {quartiles[1]:.3f}  "
+                      f"q3 {quartiles[2]:.3f}  max {values.max():.3f}")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -159,7 +159,9 @@ def test_dataset_cache_returns_identical_results(synthetic_dataset, tmp_path):
     )
     first = dataset[0]
     second = dataset[0]  # served from the cache this time
-    assert np.array_equal(first.image, second.image)
+    # The image is stored as float16 to keep the cache small, so compare within
+    # that precision rather than bit for bit. Masks are stored losslessly.
+    assert np.allclose(first.image, second.image, atol=1e-3)
     assert np.array_equal(first.mask, second.mask)
     assert first.disk.radius == pytest.approx(second.disk.radius)
     assert first.file_name == second.file_name
@@ -272,3 +274,85 @@ def test_dataset_rescales_when_image_and_annotation_sizes_differ(
     assert prepared.mask.shape[0] == coco["images"][0]["height"] // 2
     assert prepared.mask.sum() > 0
     assert not (prepared.mask & ~prepared.valid).any()
+
+
+def test_patch_dataset_bounds_its_memory(synthetic_dataset):
+    """A 700-frame set at full resolution would be 77 GB if cached unbounded."""
+    pytest.importorskip("torch")
+    from filaseg.data.dataset import FilamentPatchDataset
+
+    source = MagfiloDataset(
+        synthetic_dataset / "annotations.json", synthetic_dataset / "images"
+    )
+    patches = FilamentPatchDataset(
+        source, patch_size=64, samples_per_epoch=40, seed=0, max_cached=2
+    )
+    for index in range(40):
+        patches[index]
+    assert len(patches._cache) <= 2
+    # Evicted observations must not leave their position lists behind.
+    assert set(patches._positions) <= set(patches._cache)
+
+
+def test_patch_dataset_evicts_least_recently_used(synthetic_dataset):
+    pytest.importorskip("torch")
+    from filaseg.data.dataset import FilamentPatchDataset
+
+    source = MagfiloDataset(
+        synthetic_dataset / "annotations.json", synthetic_dataset / "images"
+    )
+    patches = FilamentPatchDataset(source, patch_size=64, samples_per_epoch=4,
+                                   max_cached=2)
+    patches._observation(0)
+    patches._observation(1)
+    patches._observation(0)  # refreshes 0, so 1 is now the oldest
+    patches._observation(2)
+    assert 1 not in patches._cache
+    assert {0, 2} <= set(patches._cache)
+
+
+def test_cache_round_trip_is_faithful(synthetic_dataset, tmp_path):
+    """The compact cache format must not change any supervision target."""
+    cold_source = MagfiloDataset(
+        synthetic_dataset / "annotations.json", synthetic_dataset / "images"
+    )
+    cached_source = MagfiloDataset(
+        synthetic_dataset / "annotations.json",
+        synthetic_dataset / "images",
+        cache_dir=tmp_path / "cache",
+    )
+    cold = cold_source[0]
+    cached_source[0]              # writes the cache
+    warm = cached_source[0]       # reads it back
+
+    # Discrete fields must survive exactly.
+    for field in ("mask", "valid", "instances", "boundary"):
+        assert np.array_equal(getattr(cold, field), getattr(warm, field)), field
+    # Quantised fields must be well inside the precision of an 8-bit source.
+    assert np.abs(cold.image - warm.image).max() < 1e-3
+    assert np.abs(cold.spine - warm.spine).max() < 1e-2
+    assert np.abs(cold.weight - warm.weight).max() < 0.05
+    assert np.array_equal(cold.mu, warm.mu)
+    assert cold.disk.radius == pytest.approx(warm.disk.radius)
+
+
+def test_stale_cache_is_ignored_not_misread(synthetic_dataset, tmp_path):
+    dataset = MagfiloDataset(
+        synthetic_dataset / "annotations.json",
+        synthetic_dataset / "images",
+        cache_dir=tmp_path / "cache",
+    )
+    prepared = dataset[0]
+
+    # A cache from an older layout, and a truncated one, must both be discarded
+    # and recomputed rather than raising. Both halves of the split cache are
+    # exercised: photometry lives under frames/, annotations under targets/.
+    for part in ("targets", "frames"):
+        cache_file = next((tmp_path / "cache" / part).glob("*.npz"))
+        np.savez_compressed(cache_file, version=np.array(0), junk=np.zeros(3))
+        assert np.array_equal(dataset[0].mask, prepared.mask)
+
+        dataset[0]  # rewrites a good cache
+        cache_file = next((tmp_path / "cache" / part).glob("*.npz"))
+        cache_file.write_bytes(cache_file.read_bytes()[:64])
+        assert np.array_equal(dataset[0].mask, prepared.mask)

@@ -129,8 +129,31 @@ class EdgeGuidedAttention(nn.Module):
             nn.Conv2d(channels * 2, channels, 1),
         )
 
+    #: Above this many bottleneck tokens the attention matrix stops being
+    #: affordable. Self-attention is quadratic in the token count, and the token
+    #: count is itself quadratic in the bottleneck's side length, so the memory
+    #: grows as the *fourth* power of ``patch_size / 2**depth``. At 512 pixels
+    #: and four downsamplings that is a 32x32 grid and a tenth of a gigabyte; at
+    #: two downsamplings it is 128x128 and thirty-four gigabytes. The cliff is
+    #: steep enough that it deserves an explanation rather than a bare kill.
+    MAX_TOKENS = 8192
+
     def forward(self, x: torch.Tensor, edge: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = x.shape
+
+        tokens = height * width
+        if tokens > self.MAX_TOKENS:
+            side = int(round(tokens**0.5))
+            raise ValueError(
+                f"Bottleneck attention would run over {tokens} tokens "
+                f"({side}x{side}), needing roughly "
+                f"{tokens ** 2 * self.n_heads * 4 * batch / 1e9:.0f} GB. "
+                f"Self-attention is quadratic in the token count, so this grows "
+                f"as the fourth power of patch_size / 2**depth. Increase the "
+                f"model depth, or reduce the patch size, until "
+                f"patch_size / 2**depth is at most "
+                f"{int(self.MAX_TOKENS ** 0.5)}."
+            )
         if self.use_edge and edge.shape[-2:] != (height, width):
             edge = nn.functional.interpolate(
                 edge, size=(height, width), mode="bilinear", align_corners=False

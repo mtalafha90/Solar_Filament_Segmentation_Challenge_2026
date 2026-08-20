@@ -14,6 +14,13 @@ run and score them:
 | **FilaNet** | An edge-guided, multi-task U-Net | Yes |
 | **Classical detector** | Ridge filtering with hysteresis thresholding | No |
 
+> **Use FilaNet for real data.** Measured on GONG-like frames, the classical
+> detector cannot exceed **IoU ≈ 0.08 at any threshold** — filament contrast
+> against the chromospheric network is around 1σ, far too low for a hand-built
+> score. It is worth running once as a pipeline check and as a fallback on
+> observations unlike anything in training, but it is not a competitive
+> baseline. See [Results](#results).
+
 ---
 
 ## Why this problem is not ordinary segmentation
@@ -37,6 +44,9 @@ brightness alone finds sunspots first.
 The pipeline addresses each of these directly, and the sections below say how.
 
 ---
+
+> **New here? [`QUICKSTART.md`](QUICKSTART.md) has the exact commands**, from
+> cloning to a submission file, including where to put the dataset.
 
 ## Installation
 
@@ -102,22 +112,32 @@ Then train, score and predict:
 
 ```bash
 # Train
-python scripts/train.py --config configs/default.yaml \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
+python scripts/train.py --config configs/default.yaml --data-dir data \
     --cache-dir data/cache --output-dir runs/filanet
 
 # Score on the held-out split
-python scripts/evaluate.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train \
-    --checkpoint runs/filanet/best.pt
+python scripts/evaluate.py --data-dir data --checkpoint runs/filanet/best.pt
 
-# Predict on test/ and write a submission
+# Predict on test/ and write the competition submission
 python scripts/predict.py --images data/test \
-    --checkpoint runs/filanet/best.pt \
-    --out submission.json --format coco
+    --checkpoint runs/filanet/best.pt --out submission.csv
 ```
+
+The default output is the competition's format: one row per predicted filament,
+keyed `<image_id>_<n>`, with the mask as pycocotools RLE counts and the size
+omitted (every frame is 2048×2048). Images with no detection contribute no rows,
+which is right — the grader matches by overlap, so a blank row would count as a
+spurious segment. `read_challenge_csv()` decodes a submission back to masks if
+you want to check one before uploading.
+
+`--data-dir` finds the annotation JSON, the training images and the test images
+by itself, whatever the JSON is called. Pass `--annotations` and `--image-dir`
+instead if your layout is unusual.
+
+Run `inspect_data.py` first and use the `pos_weight` and `patch_size` it reports
+for your data: both are set from the class imbalance and the solar radius, and
+the defaults will not suit a dataset with different statistics. They can be
+passed straight through, e.g. `--patch-size 512 --pos-weight 11.6`.
 
 Swap `--checkpoint …` for `--classical` anywhere above to use the training-free
 detector, which needs no weights and runs in a couple of seconds per frame.
@@ -125,7 +145,29 @@ detector, which needs no weights and runs in a couple of seconds per frame.
 Two practical notes:
 
 - The first epoch is slow because every frame is preprocessed; results are
-  cached to `--cache-dir` and later epochs read them straight back.
+  cached to `--cache-dir` and later epochs read them straight back. It stores
+  only what is expensive to recompute, at the smallest precision that does not
+  lose information, and splits into photometry per *frame* and targets per
+  *annotator record* — so the 447 repeated frames in MAGFiLO are preprocessed
+  once, not twice. That is about 2.8 GB for the training split.
+- Every pixel-valued setting scales with the measured solar disk — filter
+  widths, the merge gap, size limits — so one configuration works whether the
+  frames are 512 or 2048 pixels across. These describe properties of the Sun,
+  not of the sensor.
+- Chirality is read from MAGFiLO's `Left` / `Right` categories, not from a
+  field of its own.
+- Frames may sit directly in the split directory or nested inside it; both are
+  found, matching stems exactly so a record whose image was never distributed
+  comes back missing rather than latching on to a similar name.
+- Records whose image is not in the split are skipped with a count. Several
+  records describing the *same* frame are **kept separate**: in MAGFiLO these
+  are independent complete readings by different annotators, which the challenge
+  says to treat as different images, so they serve as extra training examples
+  that expose the model to genuine annotator disagreement. Train/validation
+  splits are grouped by frame, so one image can never appear on both sides.
+- Image ids are kept exactly as the dataset gives them. MAGFiLO keys its
+  observations by the original GONG frame name (`040301-20140609195854Bh`)
+  rather than an integer, and submissions carry those names back unchanged.
 - If the distributed JPEGs were resized relative to the frames the annotations
   were drawn on, the loader detects the mismatch, warns once, and **rescales the
   annotations to the image** rather than shrinking the image — barbs do not
@@ -138,9 +180,7 @@ dataset-specific. `inspect_data.py` prints a range to search and the exact
 command:
 
 ```bash
-python scripts/tune_classical.py \
-    --annotations data/train/annotations.json \
-    --image-dir data/train --limit 40
+python scripts/tune_classical.py --data-dir data --limit 40
 ```
 
 ---
@@ -247,10 +287,11 @@ connected-component labelling does not give you:
   rule: enable it for a detector that cannot reject sunspots itself, leave it
   off for one that can.
 
-### 6. The classical detector
+### 6. The classical detector, and its hard limit
 
-No training, no weights, useful as a reference and as a fallback on observations
-unlike anything in the training set. It scores each pixel by combining a
+No training, no weights. Useful for checking the pipeline runs on your data, and
+as a fallback on observations unlike anything in the training set — but **not a
+competitive baseline on real observations**, for a reason worth understanding. It scores each pixel by combining a
 multi-scale Hessian ridge response — which responds to elongated dark structures
 and largely ignores round ones — with the local intensity deficit, then applies
 **hysteresis thresholding**: a high threshold seeds confident filament cores,
@@ -262,23 +303,62 @@ amplitude is not.
 Its one real assumption is stated in physical terms rather than hidden in a
 percentile: `expected_coverage`, the fraction of the disk covered by filament
 cores. This genuinely matters, because filament coverage varies by an order of
-magnitude over the solar cycle — seeding 1.2% of the disk when filaments cover
-5% caps recall no matter how good the score map is. Measure it from your
-annotations with `scripts/tune_classical.py` rather than guessing.
+magnitude over the solar cycle, and the default is set for real GONG data,
+where MAGFiLO's filaments cover about 0.84% of the disk. Synthetic frames are
+several times denser and want a higher value. Measure it —
+`scripts/inspect_data.py` reports it and `scripts/tune_classical.py` searches
+around it — rather than guessing.
 
 > Otsu's method was tried for this and rejected. It assumes two classes of
 > comparable size, whereas filaments are a per cent or two of the disk, so it
 > over-segments sparse frames badly — on synthetic data a frame with 1.2% true
 > coverage was split at 21%.
 
+**Why it cannot win.** On easy synthetic frames, where filaments sit 3.7σ above
+the quiet Sun, this reaches IoU 0.62. On realistic frames, where the contrast is
+about 1σ and the chromospheric network supplies competing texture, sweeping
+*every* threshold on the score map gives a best attainable IoU of **0.083**.
+That is a property of the score, not the threshold: at 0.75% prevalence and an
+ROC area of 0.75, the top percentile of any such score is dominated by the 99%
+background class. `scripts/diagnose_classical.py` measures this ceiling on your
+data in about a minute, so you can see it rather than take it on trust. A
+network wins here because it pools evidence over a whole neighbourhood and
+learns the background texture, neither of which a per-pixel score can do.
+
 ---
 
 ## Metrics
 
-`filaseg.metrics` implements everything the challenge scores — pixel IoU,
-precision, recall, `AP@IoU` at several thresholds, hit rate, miss rate,
-pairwise IoU and multi-scale IoU (MSIoU) — plus clDice as a direct read-out of
-whether fine structure survived.
+The challenge ranks on **Panoptic Quality** and the **mean Dice score**, and
+additionally assesses fragmentation, over-merging and end-to-end speed.
+`filaseg.metrics` implements all of it.
+
+Panoptic Quality is the one that shapes the design:
+
+```
+PQ = sum of IoU over matched pairs / (|TP| + 0.5|FP| + 0.5|FN|)
+```
+
+It is unforgiving in exactly the way this task needs. Splitting one filament in
+two gives a match and a false positive; merging two gives a match and a false
+negative. Both cost as much as missing a filament outright, so a prediction can
+score well on pixel overlap and badly here — which is why threshold calibration
+and checkpoint selection both optimise PQ by default, not IoU. `fragmentation()`
+then separates the two failures, since PQ punishes both without saying which
+occurred:
+
+| Prediction | PQ | SQ | RQ | Flagged as |
+|---|---|---|---|---|
+| Exact | 1.000 | 1.000 | 1.000 | — |
+| One filament missed | 0.800 | 1.000 | 0.800 | missed |
+| One spurious extra | 0.857 | 1.000 | 0.857 | spurious |
+| One filament split in two | 0.571 | 1.000 | 0.571 | one-to-many |
+| Two filaments merged | 0.400 | 1.000 | 0.400 | many-to-one |
+| Every mask shifted 2 px | 0.667 | 0.667 | 1.000 | — |
+
+Also implemented: pixel IoU, precision, recall, `AP@IoU` at several thresholds,
+hit and miss rates, pairwise IoU, multi-scale IoU (MSIoU), and clDice as a
+direct read-out of whether fine structure survived.
 
 **MSIoU** exists because plain IoU judges thin structures poorly: a filament
 three pixels wide predicted one pixel to the left scores near zero despite
@@ -368,7 +448,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-115 tests cover geometry, photometry, annotation parsing and encoding, the loss
+182 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

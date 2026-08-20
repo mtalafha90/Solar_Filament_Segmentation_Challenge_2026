@@ -24,6 +24,7 @@ import numpy as np
 
 from filaseg.classical import ClassicalConfig, choose_thresholds, hysteresis, score_map
 from filaseg.data.dataset import MagfiloDataset
+from filaseg.data.layout import discover, resolve_annotations
 from filaseg.metrics import aggregate, evaluate
 from filaseg.postprocess.instances import InstanceConfig, extract_instances
 
@@ -31,8 +32,9 @@ from filaseg.postprocess.instances import InstanceConfig, extract_instances
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--annotations", type=Path, required=True)
-    parser.add_argument("--image-dir", type=Path, required=True, dest="image_dir")
+    parser.add_argument("--data-dir", type=Path, dest="data_dir")
+    parser.add_argument("--annotations", type=Path)
+    parser.add_argument("--image-dir", type=Path, dest="image_dir")
     parser.add_argument("--cache-dir", type=Path, dest="cache_dir")
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--ridge-weights", type=float, nargs="+",
@@ -47,6 +49,17 @@ def main() -> None:
                         help="metric to maximise (iou, msiou, cl_dice, mean_pairwise_iou)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
+
+    if args.data_dir and not args.image_dir:
+        args.image_dir = discover(args.data_dir).train_dir
+    if args.image_dir is None:
+        raise SystemExit("--image-dir is required (or pass --data-dir)")
+    try:
+        args.annotations = resolve_annotations(
+            args.annotations, args.image_dir, args.data_dir
+        )
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from error
 
     dataset = MagfiloDataset(args.annotations, args.image_dir, args.cache_dir)
     n = min(len(dataset), args.limit)

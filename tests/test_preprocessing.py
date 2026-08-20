@@ -108,3 +108,64 @@ def test_preprocess_handles_nan():
     image[10:20, 10:20] = np.nan
     processed, _, _ = preprocess(image)
     assert np.isfinite(processed).all()
+
+
+def test_smooth_background_matches_the_direct_computation():
+    """Wide Gaussians are decimated for speed; the result must not shift."""
+    from scipy import ndimage as ndi
+
+    from filaseg.preprocessing.photometry import smooth_background
+
+    rng = np.random.default_rng(0)
+    values = rng.random((256, 256)).astype(np.float32)
+    weights = np.zeros((256, 256), dtype=np.float32)
+    weights[20:240, 20:240] = 1.0  # a validity mask with real edges
+
+    for sigma in (16.0, 32.0, 48.0):
+        exact = ndi.gaussian_filter(values * weights, sigma, mode="nearest") / np.maximum(
+            ndi.gaussian_filter(weights, sigma, mode="nearest"), 1e-6
+        )
+        fast = smooth_background(values * weights, weights, sigma)
+        inside = weights > 0
+        relative = np.abs(fast - exact)[inside] / np.maximum(np.abs(exact)[inside], 1e-6)
+        # Comfortably below the quantisation of an 8-bit source (1/255).
+        assert np.median(relative) < 1e-2
+        assert np.percentile(relative, 99) < 5e-2
+
+
+def test_smooth_background_is_exact_for_narrow_kernels():
+    from scipy import ndimage as ndi
+
+    from filaseg.preprocessing.photometry import smooth_background
+
+    values = np.random.default_rng(1).random((64, 64)).astype(np.float32)
+    weights = np.ones((64, 64), dtype=np.float32)
+    exact = ndi.gaussian_filter(values, 4.0, mode="nearest")
+    assert np.allclose(smooth_background(values, weights, 4.0), exact, atol=1e-5)
+
+
+def test_smooth_background_ignores_pixels_outside_the_mask():
+    """Normalised convolution: zero-weight pixels must not pull the estimate down."""
+    from filaseg.preprocessing.photometry import smooth_background
+
+    values = np.zeros((128, 128), dtype=np.float32)
+    weights = np.zeros((128, 128), dtype=np.float32)
+    values[:64] = 5.0
+    weights[:64] = 1.0  # only the top half is valid
+
+    background = smooth_background(values, weights, 12.0)
+    # Well inside the valid region the estimate must be the valid value, not an
+    # average that has been dragged towards the empty half.
+    assert background[20, 64] == pytest.approx(5.0, rel=0.02)
+
+
+def test_ridge_response_is_exact_at_the_shipped_scales():
+    """The shipped scales must not be decimated: it moves the detections."""
+    from filaseg.classical import ClassicalConfig, ridge_response
+
+    image = np.zeros((128, 128), dtype=np.float32)
+    image[62:68, 10:118] = 1.0
+    scales = ClassicalConfig().scales
+    default = ridge_response(image, scales)
+    exact = ridge_response(image, scales, max_direct_sigma=1e9)
+    assert np.array_equal(default, exact)

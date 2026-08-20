@@ -2,14 +2,14 @@
 
 A filament is defined as much by its outline as by its interior: the barbs that
 the challenge scores most heavily are thin threads whose only signature is a
-pair of nearby edges.  Plain self-attention at a U-Net bottleneck has no notion
+pair of nearby edges. Plain self-attention at a U-Net bottleneck has no notion
 of that; it mixes tokens by feature similarity alone, and a barb's tokens look
 much like the quiet Sun around them.
 
 The module below extracts an explicit edge map from the input image with a
 learnable filter bank (initialised to Sobel and Laplacian kernels, so it starts
 out as a real edge detector and refines from there), then uses that map to
-modulate the attention Queries and Keys.  Tokens that sit on a strong edge
+modulate the attention Queries and Keys. Tokens that sit on a strong edge
 therefore attend differently from tokens in a smooth region, and the network
 gets an inductive bias towards boundary structure without being told where any
 particular filament is.
@@ -42,12 +42,7 @@ def _edge_kernels() -> torch.Tensor:
 
 
 class LearnableEdgeMap(nn.Module):
-    """Produce a multi-channel edge embedding from the raw input image.
-
-    Args:
-        in_channels: Channels in the model input.
-        out_channels: Width of the edge embedding.
-    """
+    """Produce a multi-channel edge embedding from the raw input image."""
 
     def __init__(self, in_channels: int = 1, out_channels: int = 32) -> None:
         super().__init__()
@@ -57,6 +52,10 @@ class LearnableEdgeMap(nn.Module):
         with torch.no_grad():
             weight = bank.repeat(1, in_channels, 1, 1) / max(in_channels, 1)
             self.filters.weight.copy_(weight)
+        # FilaNet applies a model-wide Conv2d initializer after construction.
+        # Mark this bank so that initializer does not destroy the physical
+        # Sobel/Laplacian/ridge starting point.
+        self.filters._keep_init = True
 
         self.project = nn.Sequential(
             nn.Conv2d(n_kernels, out_channels, 1, bias=False),
@@ -68,23 +67,11 @@ class LearnableEdgeMap(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Rectifying the responses means the embedding measures edge strength
-        # rather than edge polarity, which is what we want to steer attention.
         return self.project(torch.abs(self.filters(x)))
 
 
 class EdgeGuidedAttention(nn.Module):
-    """Multi-head self-attention whose Queries and Keys are modulated by edges.
-
-    Values are deliberately left untouched: the edge map should decide *what
-    attends to what*, not overwrite the semantic content being aggregated.
-
-    Args:
-        channels: Width of the feature map being attended over.
-        edge_channels: Width of the edge embedding.
-        n_heads: Number of attention heads.
-        dropout: Dropout applied to the attention output.
-    """
+    """Multi-head self-attention whose Queries and Keys are modulated by edges."""
 
     def __init__(
         self,
@@ -107,17 +94,16 @@ class EdgeGuidedAttention(nn.Module):
         self.to_k = nn.Conv2d(channels, channels, 1, bias=False)
         self.to_v = nn.Conv2d(channels, channels, 1, bias=False)
 
-        # The linear maps that carry edge information into Q and K. With
-        # ``use_edge`` off the block degenerates to ordinary self-attention,
-        # which is the ablation baseline.
         if self.use_edge:
             self.edge_to_q = nn.Conv2d(edge_channels, channels, 1, bias=False)
             self.edge_to_k = nn.Conv2d(edge_channels, channels, 1, bias=False)
-            # Start at zero so the block begins as ordinary self-attention and
-            # learns how much edge guidance to admit. This keeps early training
-            # stable no matter how the edge bank is scaled.
+            # Start as ordinary self-attention and learn how much edge guidance
+            # to admit. These zero weights must also survive FilaNet's later
+            # model-wide initialization pass.
             nn.init.zeros_(self.edge_to_q.weight)
             nn.init.zeros_(self.edge_to_k.weight)
+            self.edge_to_q._keep_init = True
+            self.edge_to_k._keep_init = True
 
         self.project = nn.Conv2d(channels, channels, 1)
         self.dropout = nn.Dropout(dropout)
@@ -129,13 +115,6 @@ class EdgeGuidedAttention(nn.Module):
             nn.Conv2d(channels * 2, channels, 1),
         )
 
-    #: Above this many bottleneck tokens the attention matrix stops being
-    #: affordable. Self-attention is quadratic in the token count, and the token
-    #: count is itself quadratic in the bottleneck's side length, so the memory
-    #: grows as the *fourth* power of ``patch_size / 2**depth``. At 512 pixels
-    #: and four downsamplings that is a 32x32 grid and a tenth of a gigabyte; at
-    #: two downsamplings it is 128x128 and thirty-four gigabytes. The cliff is
-    #: steep enough that it deserves an explanation rather than a bare kill.
     MAX_TOKENS = 8192
 
     def forward(self, x: torch.Tensor, edge: torch.Tensor) -> torch.Tensor:
@@ -168,7 +147,9 @@ class EdgeGuidedAttention(nn.Module):
         value = self.to_v(normed)
 
         def heads(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.reshape(batch, self.n_heads, self.head_dim, height * width).transpose(2, 3)
+            return tensor.reshape(
+                batch, self.n_heads, self.head_dim, height * width
+            ).transpose(2, 3)
 
         attended = nn.functional.scaled_dot_product_attention(
             heads(query), heads(key), heads(value), scale=self.scale

@@ -51,6 +51,12 @@ The pipeline addresses each of these directly, and the sections below say how.
 ## Installation
 
 ```bash
+conda env create -f environment.yml && conda activate filaments
+```
+
+or, without conda:
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

@@ -41,10 +41,23 @@ amp: true
 # it if the model under-segments, lower it if it floods the disk.
 pos_weight: 11.6
 
-# Validation runs on whole disks, and the best threshold is stored alongside the
-# checkpoint so that prediction needs no manual calibration.
+# Validation runs on whole disks with the same post-processing a submission
+# would use, and the best threshold is stored alongside the checkpoint so that
+# prediction needs no manual calibration.
+#
+# It is the slowest thing in an epoch: whole-disk inference plus metrics at full
+# resolution, roughly ten seconds a frame. If it dominates your epoch time, turn
+# these three, in this order: raise val_every, lower val_max_images, lower
+# instance_thresholds.
 val_every: 1
-val_tile: 512   # whole-disk validation is tiled at this size
+val_tile: 512          # whole-disk validation is tiled at this size
+val_max_images: 32     # cap on frames scored per epoch
+instance_thresholds: 2 # thresholds the costly instance metrics run at
+
+# Memory the in-memory observation cache may use, shared across DataLoader
+# workers. A prepared 2048-pixel frame is about 110 MB, so a plain count would
+# mean something quite different at each resolution.
+cache_budget_gb: 3.0
 
 model:
   in_channels: 2           # flattened intensity + heliocentric-angle geometry

@@ -47,6 +47,13 @@ class TrainConfig:
     samples_per_epoch: int = 2000
     positive_fraction: float = 0.7
     num_workers: int = 0
+    cache_budget_gb: float = 3.0
+    """Total memory the in-memory observation cache may use, across all workers.
+
+    Each DataLoader worker keeps its own cache, so the budget is divided between
+    them. Stated as memory rather than a count because a count that is
+    comfortable at 512 pixels is eight times the memory at 2048.
+    """
 
     epochs: int = 60
     learning_rate: float = 3e-4
@@ -75,8 +82,26 @@ class TrainConfig:
     """
     instance_config: InstanceConfig = field(default_factory=InstanceConfig)
     """Post-processing used when validating, so validation matches submission."""
-    instance_thresholds: int = 3
-    """How many thresholds to evaluate the costly instance metrics at."""
+    instance_thresholds: int = 2
+    """How many thresholds to evaluate the costly instance metrics at.
+
+    Two is enough: the threshold maximising Panoptic Quality is next to the one
+    maximising Dice, never far from it, and each extra candidate costs a full
+    instance extraction plus clDice and multi-scale IoU on every validation
+    frame -- about five seconds each at full resolution.
+    """
+    val_max_images: int = 32
+    """Cap on validation observations per epoch.
+
+    Validation runs whole-disk inference and full-resolution metrics, so it is
+    the slowest thing that happens per epoch, and it holds one probability map
+    per observation. A cap bounds both. Thirty-two frames estimate a mean well
+    enough to choose a threshold and a checkpoint; the number you report should
+    come from ``scripts/evaluate.py`` over the whole split.
+
+    Together with ``val_every`` and ``instance_thresholds``, this is the knob to
+    turn if validation is dominating your epoch time.
+    """
 
 
 def split_ids(
@@ -124,6 +149,38 @@ def split_ids(
     train_indices = [i for key in keys if key not in val_keys for i in members[key]]
     val_indices = [i for key in keys if key in val_keys for i in members[key]]
     return sorted(train_indices), sorted(val_indices)
+
+
+def check_geometry(config: TrainConfig) -> None:
+    """Reject patch and tile sizes the model's depth cannot afford, before training.
+
+    Bottleneck self-attention is quadratic in its token count, and that count is
+    quadratic in ``size / 2**depth``, so cost grows as the fourth power. The
+    validation tile is the easy one to get wrong, because it is used only after
+    a full epoch of training has already been spent.
+
+    Raises:
+        ValueError: If either size would exceed what the attention block allows.
+    """
+    from .models.edge_attention import EdgeGuidedAttention
+
+    limit = int(EdgeGuidedAttention.MAX_TOKENS**0.5)
+    for name, size in (("patch_size", config.patch_size), ("val_tile", config.val_tile)):
+        side = size >> config.model.depth
+        if side > limit:
+            raise ValueError(
+                f"{name}={size} with depth={config.model.depth} puts "
+                f"{side}x{side} = {side * side} tokens through bottleneck "
+                f"attention, which is quadratic in that count. Either raise "
+                f"model depth to {config.model.depth + (side // limit).bit_length()} "
+                f"or lower {name} to {limit << config.model.depth}."
+            )
+        if size % (1 << config.model.depth):
+            raise ValueError(
+                f"{name}={size} is not divisible by 2**depth="
+                f"{1 << config.model.depth}, so the encoder and decoder grids "
+                f"would not line up."
+            )
 
 
 def build_scheduler(
@@ -197,20 +254,30 @@ def validate(
     # thresholds that look best by pixel overlap. The optimum of PQ is never far
     # from the optimum of Dice, so this costs nothing in practice.
     cheap_key = "dice" if selection_metric != "iou" else "iou"
-    probabilities: list[tuple[np.ndarray, object]] = []
+
+    # Only the probability maps are carried between the two passes, and as
+    # float16. Holding the prepared observations too would be ruinous: each is
+    # about 110 MB at full resolution, so a 170-frame validation set would
+    # accumulate over 20 GB and exhaust memory before the first epoch finished.
+    # They are cheap to fetch again, being served from the LRU or the disk cache.
+    probabilities: list[np.ndarray] = []
 
     for index in indices:
         prepared = dataset[index]
         probability = predict_probability(model, prepared.input_stack(), config)
         probability = probability * prepared.valid
-        probabilities.append((probability, prepared))
+        probabilities.append(probability.astype(np.float16))
 
         for threshold in thresholds:
+            # Only the confusion-matrix metrics here: they are essentially free,
+            # and they are what ranks the thresholds. clDice and multi-scale IoU
+            # each cost about a second on a full-resolution frame and are
+            # reported rather than used for selection, so they wait for the
+            # short list.
             predicted = probability >= threshold
-            scores = pixel_scores(predicted, prepared.mask, prepared.valid).as_dict()
-            scores["cl_dice"] = cl_dice(predicted, prepared.mask)
-            scores["msiou"] = float(multiscale_iou(predicted, prepared.mask))
-            per_threshold[threshold].append(scores)
+            per_threshold[threshold].append(
+                pixel_scores(predicted, prepared.mask, prepared.valid).as_dict()
+            )
 
     ranked = sorted(
         thresholds,
@@ -220,7 +287,9 @@ def validate(
     candidates = ranked[: max(1, instance_thresholds)]
 
     # Attach instance metrics to the matching per-image records.
-    for position, (probability, prepared) in enumerate(probabilities):
+    for position, index in enumerate(indices):
+        probability = probabilities[position].astype(np.float32)
+        prepared = dataset[index]
         truth_instances = instance_masks_from_labels(prepared.instances)
         for threshold in candidates:
             labels = extract_instances(
@@ -230,6 +299,9 @@ def validate(
             )
             predicted_instances = instance_masks_from_labels(labels)
             record = per_threshold[threshold][position]
+            predicted = probability >= threshold
+            record["cl_dice"] = cl_dice(predicted, prepared.mask)
+            record["msiou"] = float(multiscale_iou(predicted, prepared.mask))
             record.update(
                 panoptic_quality(predicted_instances, truth_instances).as_dict()
             )
@@ -271,6 +343,7 @@ def train(config: TrainConfig) -> dict[str, float]:
     Returns:
         The best validation summary seen during the run.
     """
+    check_geometry(config)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
@@ -297,6 +370,9 @@ def train(config: TrainConfig) -> dict[str, float]:
         positive_fraction=config.positive_fraction,
         augment=True,
         seed=config.seed,
+        cache_budget_bytes=int(
+            config.cache_budget_gb * 1e9 / max(1, config.num_workers)
+        ),
     )
     loader = DataLoader(
         patches,
@@ -333,9 +409,18 @@ def train(config: TrainConfig) -> dict[str, float]:
         for batch in loader:
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             optimiser.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                outputs = model(batch["input"])
-                loss, components = criterion(outputs, batch)
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    outputs = model(batch["input"])
+                    loss, components = criterion(outputs, batch)
+            except torch.cuda.OutOfMemoryError as error:  # pragma: no cover
+                raise RuntimeError(
+                    f"Ran out of GPU memory at patch_size={config.patch_size}, "
+                    f"batch_size={config.batch_size}. Halve --batch-size first; "
+                    f"if that is not enough, halve --patch-size too. Memory grows "
+                    f"with the square of the patch size and linearly with the "
+                    f"batch."
+                ) from error
 
             scaler.scale(loss).backward()
             if config.grad_clip > 0:
@@ -363,17 +448,35 @@ def train(config: TrainConfig) -> dict[str, float]:
                 config.cache_dir,
                 image_ids=[source.records[i].image_id for i in val_indices],
             )
-            summary = validate(
-                model,
-                val_source,
-                list(range(len(val_source))),
-                config.thresholds,
-                config.device,
-                config.val_tile,
-                selection_metric=config.selection_metric,
-                instance_config=config.instance_config,
-                instance_thresholds=config.instance_thresholds,
-            )
+            n_val = len(val_source)
+            if config.val_max_images and n_val > config.val_max_images:
+                # A fixed, evenly spaced subset, so the score is comparable
+                # between epochs rather than drifting with a random draw.
+                step = n_val / config.val_max_images
+                val_indices_used = [
+                    int(i * step) for i in range(config.val_max_images)
+                ]
+            else:
+                val_indices_used = list(range(n_val))
+            try:
+                summary = validate(
+                    model,
+                    val_source,
+                    val_indices_used,
+                    config.thresholds,
+                    config.device,
+                    config.val_tile,
+                    selection_metric=config.selection_metric,
+                    instance_config=config.instance_config,
+                    instance_thresholds=config.instance_thresholds,
+                )
+            except MemoryError as error:  # pragma: no cover
+                raise RuntimeError(
+                    f"Ran out of memory validating on {len(val_indices_used)} "
+                    f"observations. Lower val_max_images (currently "
+                    f"{config.val_max_images}); each held probability map is "
+                    f"8 MB at 2048 pixels."
+                ) from error
             record.update({f"val_{k}": v for k, v in summary.items()})
 
             if summary["best_value"] > best.get("best_value", -1.0):

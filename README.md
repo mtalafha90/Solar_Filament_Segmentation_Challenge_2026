@@ -448,7 +448,7 @@ python -m pytest                  # everything
 python -m pytest -m "not slow"    # skip the ones that train a model
 ```
 
-181 tests cover geometry, photometry, annotation parsing and encoding, the loss
+182 tests cover geometry, photometry, annotation parsing and encoding, the loss
 terms, every metric, instance merging, tiled inference and a full
 raw-image-to-metrics run.
 

@@ -543,10 +543,14 @@ class FilamentPatchDataset(Dataset):
             teaches the model to reject sunspots and other dark distractors.
         augment: Apply dihedral and photometric augmentation.
         seed: Seed for reproducible sampling.
-        max_cached: How many prepared observations to hold in memory at once.
-            A full-resolution frame is about 110 MB, so this bounds the dataset's
-            footprint; lower it if memory is tight, raise it if you have room and
-            want fewer re-reads from the disk cache.
+        max_cached: Fixed number of prepared observations to hold in memory.
+            Leave unset to derive it from ``cache_budget_bytes`` instead, which
+            is safer: a count that is comfortable at 512 pixels is eight times
+            the memory at 2048, and the same number multiplies again by the
+            worker count.
+        cache_budget_bytes: Memory the in-memory cache may use, when
+            ``max_cached`` is not given. The count is worked out from the first
+            observation's actual size, so it adapts to the resolution.
     """
 
     def __init__(
@@ -557,7 +561,8 @@ class FilamentPatchDataset(Dataset):
         positive_fraction: float = 0.7,
         augment: bool = True,
         seed: int = 0,
-        max_cached: int = 12,
+        max_cached: int | None = None,
+        cache_budget_bytes: int = 1_500_000_000,
     ) -> None:
         if not _TORCH:  # pragma: no cover
             raise ImportError("FilamentPatchDataset needs PyTorch installed")
@@ -567,13 +572,15 @@ class FilamentPatchDataset(Dataset):
         self.positive_fraction = float(positive_fraction)
         self.augment = bool(augment)
         self.seed = int(seed)
-        self.max_cached = max(1, int(max_cached))
+        self.cache_budget_bytes = int(cache_budget_bytes)
+        # Resolved on the first load, once an observation's real size is known.
+        self.max_cached = max(1, int(max_cached)) if max_cached else 0
         self._epoch = 0
         # Least-recently-used, and bounded on purpose. A prepared 2048-pixel
         # observation is about 110 MB in memory, so holding a 700-frame training
-        # set would need 77 GB. Twelve is roughly 1.3 GB and is plenty, because
-        # crops are drawn at random and each observation is revisited often
-        # while it is resident.
+        # set would need 77 GB. The bound is a memory budget rather than a count
+        # so that it holds at any resolution, and each DataLoader worker keeps
+        # its own cache, so the budget must already account for that.
         self._cache: OrderedDict[int, PreparedObservation] = OrderedDict()
         self._positions: OrderedDict[int, np.ndarray] = OrderedDict()
 
@@ -584,12 +591,28 @@ class FilamentPatchDataset(Dataset):
     def __len__(self) -> int:
         return self.samples_per_epoch
 
+    @staticmethod
+    def _observation_bytes(prepared: PreparedObservation) -> int:
+        return int(
+            sum(
+                getattr(prepared, name).nbytes
+                for name in (
+                    "image", "valid", "mu", "mask",
+                    "instances", "spine", "boundary", "weight",
+                )
+            )
+        )
+
     def _observation(self, index: int) -> PreparedObservation:
         if index in self._cache:
             self._cache.move_to_end(index)
             return self._cache[index]
 
         prepared = self.source[index]
+        if not self.max_cached:
+            # Work out how many fit in the budget now the real size is known.
+            size = max(1, self._observation_bytes(prepared))
+            self.max_cached = max(1, self.cache_budget_bytes // size)
         self._cache[index] = prepared
         while len(self._cache) > self.max_cached:
             evicted, _ = self._cache.popitem(last=False)

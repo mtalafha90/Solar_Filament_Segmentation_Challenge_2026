@@ -65,6 +65,7 @@ def test_training_reduces_loss_and_produces_a_usable_checkpoint(
         amp=False,
         model=FilaNetConfig(base_width=8, depth=2, n_heads=2),
         thresholds=(0.4, 0.5),
+        val_tile=128,   # must suit the model depth; check_geometry enforces it
     )
     best = train(config)
 
@@ -128,3 +129,27 @@ def test_classical_pipeline_needs_no_training(synthetic_dataset):
     scores = evaluate(labels, prepared.instances, prepared.valid)
     assert labels.max() >= 1
     assert scores["iou"] > 0.2
+
+
+def test_geometry_is_checked_before_training_starts():
+    """A tile too large for the model's depth must fail now, not after an epoch."""
+    from filaseg.train import check_geometry
+
+    # The shipped combination is fine.
+    check_geometry(TrainConfig(patch_size=512, val_tile=512,
+                               model=FilaNetConfig(depth=4)))
+
+    # A shallow model with a large validation tile is not, and validation only
+    # runs once a whole epoch has been spent.
+    with pytest.raises(ValueError, match="val_tile"):
+        check_geometry(TrainConfig(patch_size=128, val_tile=512,
+                                   model=FilaNetConfig(depth=2)))
+
+    with pytest.raises(ValueError, match="patch_size"):
+        check_geometry(TrainConfig(patch_size=1024, val_tile=128,
+                                   model=FilaNetConfig(depth=2)))
+
+    # And a size that does not divide by the downsampling factor.
+    with pytest.raises(ValueError, match="divisible"):
+        check_geometry(TrainConfig(patch_size=300, val_tile=128,
+                                   model=FilaNetConfig(depth=4)))

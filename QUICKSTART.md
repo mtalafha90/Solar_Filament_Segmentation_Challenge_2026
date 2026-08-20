@@ -248,9 +248,21 @@ the annotations to the image automatically and only warns once.
 
 **Out of GPU memory** — lower `--batch-size`, then `--patch-size`.
 
-**Out of system memory** — the dataset holds at most 12 preprocessed frames in
-RAM at once (roughly 1.3 GB at full resolution). Lower `max_cached` on
-`FilamentPatchDataset` if that is still too much.
+**Out of system memory / the run is killed** — the in-memory caches are bounded
+by `cache_budget_gb` (3 GB by default, shared across DataLoader workers) and
+validation by `val_max_images`. Lower either if your machine is tight. Note that
+each DataLoader worker keeps its own cache, so `num_workers` multiplies nothing
+now, but it did before: if you are on a version older than this, upgrade.
+
+**Out of GPU memory** — halve `--batch-size` first, then `--patch-size`. Memory
+grows linearly with the batch and with the square of the patch.
+
+**`patch_size=... with depth=... puts NxN tokens through bottleneck attention`**
+— the bottleneck attention is quadratic in its token count, which is itself
+quadratic in `patch_size / 2**depth`, so cost grows as the fourth power. Raise
+`model.depth` or lower the size, as the message says. This is checked before
+training starts, including for `val_tile`, which otherwise only fails after a
+whole epoch has been spent.
 
 **A cache file was corrupted by an interrupted run** — nothing to do. Damaged or
 outdated cache entries are detected and recomputed automatically.
@@ -258,6 +270,10 @@ outdated cache entries are detected and recomputed automatically.
 **Training loss goes to zero and nothing is predicted** — the positive class is
 being ignored. Raise `pos_weight` in `configs/default.yaml` to the value
 `inspect_data.py` suggested.
+
+**Validation dominates the epoch time** — it runs whole-disk inference plus
+full-resolution metrics, roughly ten seconds a frame. Turn these three, in
+order: raise `val_every`, lower `val_max_images`, lower `instance_thresholds`.
 
 **Everything is slow on CPU** — that is expected for training. The classical
 detector (`--classical`) needs no training at all and is the right thing to run

@@ -279,6 +279,34 @@ validation by `val_max_images`. Lower either if your machine is tight. Note that
 each DataLoader worker keeps its own cache, so `num_workers` multiplies nothing
 now, but it did before: if you are on a version older than this, upgrade.
 
+**`undefined symbol: ncclCommResume` (or a similar symbol) when importing torch**
+— an older NCCL is being loaded ahead of the one PyTorch's wheel bundles, which
+is what happens when conda-provided CUDA libraries mix with pip-provided ones.
+Find out what conda is contributing:
+
+```bash
+conda list | grep -Ei "nccl|cuda|cudnn|pytorch"
+echo "$LD_LIBRARY_PATH"
+```
+
+Then, in order:
+
+```bash
+# 1. Remove CUDA libraries conda is providing; PyTorch's wheel brings its own.
+conda remove --force nccl cudatoolkit cudnn 2>/dev/null
+
+# 2. Reinstall PyTorch and its NVIDIA dependencies as one matched set.
+pip uninstall -y torch
+pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+
+# 3. If LD_LIBRARY_PATH points at a system CUDA, clear it for this shell.
+unset LD_LIBRARY_PATH
+```
+
+Check with `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`.
+The tests skip the PyTorch-dependent modules rather than failing while this is
+broken, so `python -m pytest -q` still tells you the other 133 are fine.
+
 **Out of GPU memory** — halve `--batch-size` first, then `--patch-size`. Memory
 grows linearly with the batch and with the square of the patch.
 

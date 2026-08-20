@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import require
 
 from filaseg.data.coco import (
     decode_segmentation,
@@ -168,7 +169,7 @@ def test_dataset_cache_returns_identical_results(synthetic_dataset, tmp_path):
 
 
 def test_patch_dataset_yields_usable_batches(synthetic_dataset):
-    torch = pytest.importorskip("torch")
+    torch = require("torch")
     from filaseg.data.dataset import FilamentPatchDataset
 
     source = MagfiloDataset(
@@ -278,7 +279,7 @@ def test_dataset_rescales_when_image_and_annotation_sizes_differ(
 
 def test_patch_dataset_bounds_its_memory(synthetic_dataset):
     """A 700-frame set at full resolution would be 77 GB if cached unbounded."""
-    pytest.importorskip("torch")
+    require("torch")
     from filaseg.data.dataset import FilamentPatchDataset
 
     source = MagfiloDataset(
@@ -295,7 +296,7 @@ def test_patch_dataset_bounds_its_memory(synthetic_dataset):
 
 
 def test_patch_dataset_evicts_least_recently_used(synthetic_dataset):
-    pytest.importorskip("torch")
+    require("torch")
     from filaseg.data.dataset import FilamentPatchDataset
 
     source = MagfiloDataset(

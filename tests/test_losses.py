@@ -2,7 +2,9 @@
 
 import pytest
 
-torch = pytest.importorskip("torch")
+from conftest import require
+
+torch = require("torch")
 
 from filaseg.losses import (  # noqa: E402
     FilamentLoss,

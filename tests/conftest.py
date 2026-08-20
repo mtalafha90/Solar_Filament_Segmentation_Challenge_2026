@@ -1,5 +1,6 @@
 """Shared fixtures. Puts ``src`` on the path so tests run from a clean checkout."""
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -9,6 +10,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from filaseg.data.synthetic import generate_observation  # noqa: E402
+
+
+def require(module: str):
+    """Import a module, or skip the test if it cannot be used.
+
+    ``pytest.importorskip`` only skips when a module is *absent*. A module that
+    is installed but broken -- a PyTorch whose CUDA library fails to resolve a
+    symbol, say, which happens easily when conda and pip libraries are mixed --
+    raises ``ImportError`` instead, and at module scope that aborts collection
+    for the whole file. Everything that does not need the module then goes
+    unrun, which is exactly when you most want the rest of the suite to report.
+
+    Args:
+        module: Name of the module to import.
+
+    Returns:
+        The imported module.
+    """
+    try:
+        return importlib.import_module(module)
+    except Exception as error:  # noqa: BLE001 - any failure means unusable
+        pytest.skip(f"{module} is unavailable: {error}", allow_module_level=True)
 
 
 @pytest.fixture(scope="session")

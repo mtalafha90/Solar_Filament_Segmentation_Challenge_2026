@@ -21,6 +21,15 @@ git pull origin claude/solar-filament-segmentation-9bpfy6
 
 ## 2. Install
 
+**With conda:**
+
+```bash
+conda env create -f environment.yml
+conda activate filaments
+```
+
+**With a plain virtual environment:**
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -28,17 +37,33 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Python 3.10 or newer. If you have an NVIDIA GPU and want the CUDA build of
-PyTorch, install it from the official index *after* the line above:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-```
-
-Check it worked:
+Python 3.10 or newer either way. Both routes install a CUDA build of PyTorch on
+a Linux machine with an NVIDIA driver. Check:
 
 ```bash
 python -c "import torch; print(torch.__version__, 'CUDA:', torch.cuda.is_available())"
+```
+
+If that prints `CUDA: False` on a GPU machine, reinstall from the index matching
+your driver:
+
+```bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+Note that `environment.yml` takes PyTorch from pip even inside conda. PyTorch no
+longer publishes conda packages, so the pip wheels are the supported route.
+Everything else comes from conda-forge, which matters most for `pycocotools`:
+its pip package compiles a C extension at install time and often fails, while
+the conda-forge build is precompiled.
+
+**Already have a conda environment?** Install into it rather than creating a
+second one:
+
+```bash
+conda activate filaments
+conda install -c conda-forge --file <(grep -v "^#" requirements.txt | grep -v torch)
+pip install torch
 ```
 
 ## 3. Put your data here

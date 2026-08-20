@@ -1,0 +1,44 @@
+# Conda environment for the Solar Filament Segmentation Challenge 2026.
+#
+#   conda env create -f environment.yml
+#   conda activate filaments
+#
+# PyTorch is installed with pip rather than conda on purpose. PyTorch stopped
+# publishing conda packages, so the pip wheels are the supported route and are
+# the ones that carry current CUDA builds. Everything else comes from
+# conda-forge, which matters most for pycocotools: the pip package compiles a C
+# extension against numpy at install time and is a common source of build
+# failures, while the conda-forge build is precompiled.
+name: filaments
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # Core numerical and image-processing stack
+  - numpy>=1.24
+  - scipy>=1.10
+  - scikit-image>=0.21
+  - scikit-learn>=1.3
+  - pillow>=10.0
+  - pyyaml>=6.0
+
+  # Reading GONG FITS observations
+  - astropy>=5.3
+
+  # The competition submission format is pycocotools compressed RLE
+  - pycocotools>=2.0.7
+
+  # Development
+  - pytest>=7.4
+
+  - pip
+  - pip:
+      # Installs a CUDA build on Linux with an NVIDIA driver present. If it
+      # lands on the CPU-only wheel, reinstall from the index matching your
+      # driver, for example:
+      #   pip install --force-reinstall torch \
+      #       --index-url https://download.pytorch.org/whl/cu124
+      - torch>=2.0

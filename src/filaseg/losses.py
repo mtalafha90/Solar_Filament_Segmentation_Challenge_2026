@@ -1,25 +1,4 @@
-"""Loss functions built for thin, sparse structures.
-
-The single most important design choice in this project is *not* the network
-architecture but the loss.  Filaments occupy under one per cent of the solar
-disk, and the parts the challenge cares about most -- the barbs -- are a small
-fraction of that again.  Optimising plain Dice or plain cross-entropy produces
-a model that draws smooth, confident blobs over filament bodies and quietly
-deletes every fine thread, because doing so costs almost nothing on those
-objectives.
-
-Three ingredients fix that:
-
-* **clDice** (centreline Dice) scores the *topology* of the prediction by
-  comparing soft skeletons.  Deleting a barb breaks a branch of the skeleton,
-  which clDice punishes heavily even though the pixel count barely moves.
-* **Tversky** loss lets recall be weighted above precision, which counteracts
-  the model's incentive to under-segment when positives are rare.
-* **Per-pixel weights** concentrate the cross-entropy term on outlines and on
-  locally thin regions.
-
-Everything here operates on raw logits.
-"""
+"""Loss functions built for thin, sparse structures."""
 
 from __future__ import annotations
 
@@ -48,25 +27,13 @@ def soft_open(x: torch.Tensor) -> torch.Tensor:
 
 
 def soft_skeleton(x: torch.Tensor, iterations: int = 10) -> torch.Tensor:
-    """A differentiable approximation of the morphological skeleton.
-
-    This is the standard iterative thinning construction: at each step, whatever
-    the opening removes is skeleton material.  It is fully differentiable, so it
-    can sit inside a loss.
-
-    Args:
-        x: Probabilities in ``[0, 1]``, shape ``(B, C, H, W)``.
-        iterations: Thinning steps.  This bounds the half-width of structures
-            that can be reduced to a centreline, so it should comfortably exceed
-            the half-width of a typical filament.
-    """
+    """A differentiable approximation of the morphological skeleton."""
     opened = soft_open(x)
     skeleton = F.relu(x - opened)
     for _ in range(iterations):
         x = soft_erode(x)
         opened = soft_open(x)
         delta = F.relu(x - opened)
-        # Union without double counting where the new material overlaps.
         skeleton = skeleton + F.relu(delta - skeleton * delta)
     return skeleton
 
@@ -76,19 +43,26 @@ def cl_dice_loss(
     target: torch.Tensor,
     iterations: int = 10,
     smooth: float = 1.0,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Centreline Dice loss.
+    """Centreline Dice loss, optionally restricted to a validity mask.
 
-    Measures two things and combines them harmonically:
-
-    * *topology precision* -- how much of the predicted skeleton lies inside the
-      true mask (penalises spurious threads);
-    * *topology sensitivity* -- how much of the true skeleton lies inside the
-      predicted mask (penalises deleted barbs).
+    The validity mask is important for full-disk solar data: pixels outside the
+    measured disk are not part of the segmentation task and must not contribute
+    topology to either the prediction or target skeleton.
     """
     probability = torch.sigmoid(logits)
+    if mask is not None:
+        probability = probability * mask
+        target = target * mask
+
     skeleton_pred = soft_skeleton(probability, iterations)
     skeleton_true = soft_skeleton(target, iterations)
+    if mask is not None:
+        # Morphological operations can spread non-zero values by a pixel at a
+        # validity boundary; clip once more before measuring the skeletons.
+        skeleton_pred = skeleton_pred * mask
+        skeleton_true = skeleton_true * mask
 
     dims = tuple(range(1, target.dim()))
     precision = (torch.sum(skeleton_pred * target, dim=dims) + smooth) / (
@@ -109,13 +83,7 @@ def tversky_loss(
     smooth: float = 1.0,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Tversky loss, a Dice generalisation with asymmetric error weighting.
-
-    ``alpha`` weights false positives and ``beta`` false negatives.  The default
-    ``beta > alpha`` leans towards recall, which is what we want: a missed barb
-    is a hard failure on the challenge's fine-structure criterion, whereas a
-    couple of over-called pixels along an edge are comparatively cheap.
-    """
+    """Tversky loss, a Dice generalisation with asymmetric error weighting."""
     probability = torch.sigmoid(logits)
     if mask is not None:
         probability = probability * mask
@@ -163,7 +131,7 @@ def focal_loss(
     gamma: float = 2.0,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Focal loss: down-weights the easy quiet-Sun pixels that dominate the disk."""
+    """Focal loss: down-weights easy quiet-Sun pixels."""
     probability = torch.sigmoid(logits)
     ce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     p_t = probability * target + (1.0 - probability) * (1.0 - target)
@@ -189,20 +157,7 @@ class LossWeights:
 
 
 class FilamentLoss(nn.Module):
-    """The complete multi-task objective used to train FilaNet.
-
-    Args:
-        weights: Relative weight of each term.
-        tversky_alpha: False-positive weight in the Tversky term.
-        tversky_beta: False-negative weight in the Tversky term.
-        cl_dice_iterations: Thinning steps in the soft skeleton.
-        pos_weight: Positive-class weight inside the cross-entropy term.
-        cl_dice_warmup: Number of training steps over which the clDice weight is
-            ramped in from zero.  Skeletonising a randomly initialised, nearly
-            uniform prediction is meaningless and destabilises early training,
-            so the topology term only switches on once the mask term has given
-            it something with a shape.
-    """
+    """The complete multi-task objective used to train FilaNet."""
 
     def __init__(
         self,
@@ -232,17 +187,6 @@ class FilamentLoss(nn.Module):
         outputs: dict[str, torch.Tensor | list[torch.Tensor]],
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute the total loss and a breakdown for logging.
-
-        Args:
-            outputs: What :class:`~filaseg.models.filanet.FilaNet` returned.
-            batch: The training batch, with ``mask``, ``spine``, ``boundary``,
-                ``weight`` and ``valid`` entries.
-
-        Returns:
-            ``(total_loss, components)`` where ``components`` maps each term's
-            name to its scalar value.
-        """
         logits = outputs["mask"]
         assert isinstance(logits, torch.Tensor)
         target = batch["mask"]
@@ -271,7 +215,12 @@ class FilamentLoss(nn.Module):
 
         if self.weights.cl_dice > 0:
             scale = self._cl_dice_scale()
-            term = cl_dice_loss(logits, target, self.cl_dice_iterations)
+            term = cl_dice_loss(
+                logits,
+                target,
+                self.cl_dice_iterations,
+                mask=valid,
+            )
             total = total + self.weights.cl_dice * scale * term
             components["cl_dice"] = float(term.detach())
 
@@ -299,7 +248,10 @@ class FilamentLoss(nn.Module):
                     F.adaptive_max_pool2d(valid, size) if valid is not None else None
                 )
                 deep_total = deep_total + weighted_bce(
-                    deep_logits, small_target, mask=small_valid, pos_weight=self.pos_weight
+                    deep_logits,
+                    small_target,
+                    mask=small_valid,
+                    pos_weight=self.pos_weight,
                 )
             deep_total = deep_total / len(deep)
             total = total + self.weights.deep * deep_total

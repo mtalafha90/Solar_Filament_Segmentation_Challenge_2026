@@ -45,14 +45,16 @@ pos_weight: 11.6
 # would use, and the best threshold is stored alongside the checkpoint so that
 # prediction needs no manual calibration.
 #
-# Dice is the primary quantitative overlap criterion in the published challenge
-# evaluation. PQ remains reported as a useful diagnostic for splitting and
-# merging, but is not the default checkpoint-selection objective.
-selection_metric: dice
+# The challenge matches individual predicted filaments to truth by overlap and
+# reports mean Dice. The Dice of the unioned foreground can stay high even when
+# one filament is split into several submitted rows, so checkpoint/threshold
+# selection uses the per-filament matched-Dice proxy. Foreground Dice and PQ are
+# still reported as diagnostics.
+selection_metric: matched_dice
 val_every: 1
 val_tile: 512          # whole-disk validation is tiled at this size
 val_max_images: 32     # cap on frames scored per epoch
-instance_thresholds: 2 # thresholds the costly instance diagnostics run at
+instance_thresholds: 2 # used only when selecting on a cheap pixel metric
 
 # Memory the in-memory observation cache may use, shared across DataLoader
 # workers. A prepared 2048-pixel frame is about 110 MB, so a plain count would

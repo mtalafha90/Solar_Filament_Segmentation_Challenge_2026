@@ -12,6 +12,11 @@ checkpoint configuration. It never assumes that the tail of the annotation file
 is held out. When ``--limit`` is used, the requested number of validation
 annotation records is sampled evenly from that true held-out split.
 
+Probability maps are cached per physical image rather than per tuning subset.
+That means a 60-record tuning run can be expanded to the full validation split
+without recomputing images that were already inferred, including duplicate
+annotation records for the same observation.
+
 Example::
 
     python scripts/tune_postprocess.py --data-dir data \
@@ -24,6 +29,8 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
+import shutil
 import time
 import warnings
 from pathlib import Path
@@ -102,6 +109,17 @@ def validation_dataset(
     return val_source, indices, split_info
 
 
+def _record_cache_key(dataset: MagfiloDataset, index: int) -> str:
+    """Stable physical-image key; duplicate annotator records intentionally share it."""
+    return str(dataset.group_keys[index])
+
+
+def _record_cache_name(key: str) -> str:
+    """Filesystem-safe deterministic name for one physical image."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return f"{digest}.npy"
+
+
 def probability_cache_namespace(
     checkpoint: Path,
     dataset: MagfiloDataset,
@@ -109,27 +127,80 @@ def probability_cache_namespace(
     tile_size: int,
     tta: bool,
 ) -> tuple[str, dict]:
-    """Return a cache namespace that changes with every inference input.
+    """Return the cache namespace for one inference configuration.
 
-    The old cache used only integer dataset indices. That could silently reuse
-    probability maps from another checkpoint, tile size, TTA setting or split.
-    The namespace now includes a content hash of the checkpoint plus the exact
-    validation records and inference configuration.
+    The namespace depends on the model and inference settings, but deliberately
+    not on which validation subset is requested. Individual probability files
+    are keyed by physical image, so a smaller tuning subset and the full
+    validation split share the maps they have in common.
+
+    ``dataset`` and ``indices`` remain arguments for API compatibility with the
+    first cache implementation and to make call sites explicit.
     """
+    del dataset, indices
     checkpoint_sha256 = _file_sha256(checkpoint)
-    record_keys = [
-        f"{dataset.records[i].image_id}|{dataset.group_keys[i]}" for i in indices
-    ]
     manifest = {
+        "cache_schema": 2,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_sha256,
         "tile_size": int(tile_size),
         "tta": bool(tta),
-        "record_keys": record_keys,
     }
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(payload).hexdigest()[:16]
     return f"{checkpoint.stem}-{digest}", manifest
+
+
+def _legacy_probability_maps(
+    cache_root: Path,
+    checkpoint_sha256: str,
+    tile_size: int,
+    tta: bool,
+) -> dict[str, Path]:
+    """Index maps written by the old subset-specific cache implementation."""
+    found: dict[str, Path] = {}
+    if not cache_root.exists():
+        return found
+
+    for directory in cache_root.iterdir():
+        if not directory.is_dir():
+            continue
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        record_keys = manifest.get("record_keys")
+        if not isinstance(record_keys, list):
+            continue
+        if manifest.get("checkpoint_sha256") != checkpoint_sha256:
+            continue
+        if int(manifest.get("tile_size", -1)) != int(tile_size):
+            continue
+        if bool(manifest.get("tta", False)) != bool(tta):
+            continue
+
+        for position, old_key in enumerate(record_keys):
+            path = directory / f"{position:05d}.npy"
+            if not path.exists():
+                continue
+            # Old keys were ``image_id|group_key``. The group key is the
+            # physical observation and therefore the reusable inference input.
+            group_key = str(old_key).split("|", 1)[-1]
+            found.setdefault(group_key, path)
+    return found
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    """Reuse an old cached map without duplicating bytes when hard links work."""
+    if destination.exists():
+        return
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
 
 
 def cache_probabilities(
@@ -141,7 +212,7 @@ def cache_probabilities(
     tile_size: int,
     tta: bool,
 ) -> list[Path]:
-    """Run the network once over the held-out set and cache probability maps."""
+    """Cache probability maps once per physical image and reuse them across subsets."""
     from filaseg.inference import InferenceConfig, predict_probability
     from filaseg.train import load_model
 
@@ -154,21 +225,50 @@ def cache_probabilities(
     if not manifest_path.exists():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    paths = [cache_dir / f"{position:05d}.npy" for position in range(len(indices))]
-    missing = [
-        (position, index, path)
-        for position, (index, path) in enumerate(zip(indices, paths))
-        if not path.exists()
-    ]
-    if not missing:
-        print(f"reusing {len(paths)} cached probability maps from {cache_dir}")
+    keys = [_record_cache_key(dataset, index) for index in indices]
+    paths = [cache_dir / _record_cache_name(key) for key in keys]
+
+    legacy = _legacy_probability_maps(
+        cache_root,
+        manifest["checkpoint_sha256"],
+        tile_size,
+        tta,
+    )
+    migrated = 0
+    for key, path in zip(keys, paths):
+        if path.exists() or key not in legacy:
+            continue
+        _link_or_copy(legacy[key], path)
+        migrated += 1
+    if migrated:
+        print(f"reused {migrated} requested records from legacy probability caches")
+
+    # Multiple annotation records can point to the same physical observation.
+    # Infer one representative record per still-missing output path.
+    missing_by_path: dict[Path, int] = {}
+    for index, path in zip(indices, paths):
+        if not path.exists():
+            missing_by_path.setdefault(path, index)
+
+    unique_requested = len(set(paths))
+    cached_unique = unique_requested - len(missing_by_path)
+    if not missing_by_path:
+        print(
+            f"reusing {unique_requested} cached physical-image probability maps "
+            f"for {len(indices)} annotation records from {cache_dir}"
+        )
         return paths
 
     print(f"probability cache: {cache_dir}")
+    print(
+        f"cached physical images: {cached_unique}/{unique_requested}; "
+        f"new inference needed: {len(missing_by_path)}"
+    )
     model, _ = load_model(checkpoint, device)
     config = InferenceConfig(tile_size=tile_size, tta=tta, device=device)
     started = time.time()
-    for completed, (_, index, path) in enumerate(missing, start=1):
+    missing = list(missing_by_path.items())
+    for completed, (path, index) in enumerate(missing, start=1):
         prepared = dataset[index]
         probability = predict_probability(model, prepared.input_stack(), config)
         np.save(path, (probability * prepared.valid).astype(np.float16))
@@ -328,7 +428,7 @@ def main() -> None:
         raise SystemExit("parameter grid is empty after removing redundant settings")
     print(f"\nsweeping {len(grid)} configurations over the cached maps")
     print(
-        f"{'thr':>6}{'conf':>6}{'gap':>7}{'minarea':>9}"
+        f"{'thr':>7}{'conf':>7}{'gap':>7}{'minarea':>11}"
         f"{'matchedD':>10}{'fgDice':>8}{'PQ':>7}{'RQ':>7}"
         f"{'inst':>7}{'spur':>7}{'1->m':>6}{'miss':>6}"
     )
@@ -352,7 +452,7 @@ def main() -> None:
             }
         )
         print(
-            f"{threshold:>6.2f}{confidence:>6.2f}{gap:>7.1f}{area:>9.1e}"
+            f"{threshold:>7.3f}{confidence:>7.3f}{gap:>7.1f}{area:>11.2e}"
             f"{summary['matched_dice']:>10.4f}{summary['foreground_dice']:>8.4f}"
             f"{summary['pq']:>7.4f}{summary['rq']:>7.4f}"
             f"{summary['n_instances']:>7.1f}{summary['spurious']:>7.0f}"
@@ -364,14 +464,25 @@ def main() -> None:
     print("\n" + "=" * 74)
     print(f"BEST by {args.metric}")
     print("=" * 74)
+    parameter_keys = {
+        "threshold": ".6f",
+        "min_confidence": ".6f",
+        "merge_gap": ".3f",
+        "min_area_fraction": ".8g",
+    }
     for key in (
         "threshold", "min_confidence", "merge_gap", "min_area_fraction",
         "matched_dice", "matched_dice_over_truth", "matched_dice_over_pred",
         "mean_paired_dice", "foreground_dice", "pq", "rq", "n_instances",
         "spurious", "one_to_many", "many_to_one", "missed",
     ):
-        if key in best:
-            print(f"  {key:24s} {best[key]:.4f}")
+        if key not in best:
+            continue
+        if key in parameter_keys:
+            value = format(best[key], parameter_keys[key])
+        else:
+            value = f"{best[key]:.4f}"
+        print(f"  {key:24s} {value}")
 
     print("\nUse it with:")
     print(

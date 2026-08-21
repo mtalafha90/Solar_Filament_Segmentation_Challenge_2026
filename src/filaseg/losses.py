@@ -45,12 +45,7 @@ def cl_dice_loss(
     smooth: float = 1.0,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Centreline Dice loss, optionally restricted to a validity mask.
-
-    The validity mask is important for full-disk solar data: pixels outside the
-    measured disk are not part of the segmentation task and must not contribute
-    topology to either the prediction or target skeleton.
-    """
+    """Centreline Dice loss, optionally restricted to a validity mask."""
     probability = torch.sigmoid(logits)
     if mask is not None:
         probability = probability * mask
@@ -59,8 +54,6 @@ def cl_dice_loss(
     skeleton_pred = soft_skeleton(probability, iterations)
     skeleton_true = soft_skeleton(target, iterations)
     if mask is not None:
-        # Morphological operations can spread non-zero values by a pixel at a
-        # validity boundary; clip once more before measuring the skeletons.
         skeleton_pred = skeleton_pred * mask
         skeleton_true = skeleton_true * mask
 
@@ -73,6 +66,31 @@ def cl_dice_loss(
     )
     cl_dice = 2.0 * precision * sensitivity / (precision + sensitivity + 1e-8)
     return (1.0 - cl_dice).mean()
+
+
+def dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    smooth: float = 1.0,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Soft Sørensen-Dice loss for binary segmentation.
+
+    This is intentionally simpler than Tversky and clDice. It exists so the
+    large-context ResNet U-Net experiment can use the widely established
+    ``BCE + Dice`` objective as a clean control instead of changing architecture,
+    context and loss complexity at the same time.
+    """
+    probability = torch.sigmoid(logits)
+    if mask is not None:
+        probability = probability * mask
+        target = target * mask
+
+    dims = tuple(range(1, target.dim()))
+    intersection = torch.sum(probability * target, dim=dims)
+    denominator = torch.sum(probability, dim=dims) + torch.sum(target, dim=dims)
+    score = (2.0 * intersection + smooth) / (denominator + smooth)
+    return (1.0 - score).mean()
 
 
 def tversky_loss(
@@ -145,19 +163,27 @@ def focal_loss(
 
 @dataclass
 class LossWeights:
-    """Relative weights of each term in :class:`FilamentLoss`."""
+    """Relative weights and switches used by :class:`FilamentLoss`.
+
+    ``dice`` defaults to zero to preserve every historical FilaNet run exactly.
+    ``use_distance_weight`` likewise defaults to the old behaviour. A plain
+    ResNet U-Net control can therefore request BCE+Dice and disable handcrafted
+    distance weighting without changing the legacy objective.
+    """
 
     bce: float = 1.0
+    dice: float = 0.0
     tversky: float = 1.0
     cl_dice: float = 1.0
     focal: float = 0.5
     spine: float = 0.5
     boundary: float = 0.5
     deep: float = 0.4
+    use_distance_weight: bool = True
 
 
 class FilamentLoss(nn.Module):
-    """The complete multi-task objective used to train FilaNet."""
+    """The configurable segmentation objective used to train FilaNet variants."""
 
     def __init__(
         self,
@@ -191,7 +217,7 @@ class FilamentLoss(nn.Module):
         assert isinstance(logits, torch.Tensor)
         target = batch["mask"]
         valid = batch.get("valid")
-        weight = batch.get("weight")
+        weight = batch.get("weight") if self.weights.use_distance_weight else None
 
         components: dict[str, float] = {}
         total = logits.new_zeros(())
@@ -200,6 +226,11 @@ class FilamentLoss(nn.Module):
             term = weighted_bce(logits, target, weight, valid, self.pos_weight)
             total = total + self.weights.bce * term
             components["bce"] = float(term.detach())
+
+        if self.weights.dice > 0:
+            term = dice_loss(logits, target, mask=valid)
+            total = total + self.weights.dice * term
+            components["dice"] = float(term.detach())
 
         if self.weights.tversky > 0:
             term = tversky_loss(
@@ -231,7 +262,11 @@ class FilamentLoss(nn.Module):
             total = total + self.weights.spine * term
             components["spine"] = float(term.detach())
 
-        if self.weights.boundary > 0 and "boundary" in outputs and "boundary" in batch:
+        if (
+            self.weights.boundary > 0
+            and "boundary" in outputs
+            and "boundary" in batch
+        ):
             boundary_logits = outputs["boundary"]
             assert isinstance(boundary_logits, torch.Tensor)
             term = weighted_bce(boundary_logits, batch["boundary"], mask=valid)
@@ -245,7 +280,9 @@ class FilamentLoss(nn.Module):
                 size = deep_logits.shape[-2:]
                 small_target = F.adaptive_max_pool2d(target, size)
                 small_valid = (
-                    F.adaptive_max_pool2d(valid, size) if valid is not None else None
+                    F.adaptive_max_pool2d(valid, size)
+                    if valid is not None
+                    else None
                 )
                 deep_total = deep_total + weighted_bce(
                     deep_logits,

@@ -1,0 +1,83 @@
+# Large-context control experiment for MAGFiLO / Filament Segmentation 2026.
+#
+# Purpose:
+#   Test the strongest evidence-backed changes against the E20 scratch model:
+#   (1) ImageNet-pretrained ResNet34 features,
+#   (2) native 1024x1024 context instead of 256x256 crops,
+#   (3) a plain U-Net decoder with no bottleneck attention,
+#   (4) simple BCE + Dice supervision from segmentation masks only.
+#
+# Run:
+#   python scripts/train.py --config configs/resnet34_unet_1024.yaml --data-dir data
+#
+# Start with batch_size=1. If a GPU has comfortable headroom, try batch_size=2
+# only after a smoke epoch succeeds.
+
+annotations: ""
+image_dir: ""
+cache_dir: "data/cache"
+output_dir: "runs/resnet34_unet_1024"
+
+# Leakage-safe grouped split: duplicate annotator records of the same physical
+# GONG frame remain on the same side.
+val_fraction: 0.15
+seed: 0
+
+# Native resolution: DO NOT resize a 2048 frame to 1024. Each sample is a true
+# 1024-pixel crop from the original image, retaining thin filament structure.
+patch_size: 1024
+batch_size: 1
+samples_per_epoch: 1000
+positive_fraction: 0.70
+num_workers: 2
+cache_budget_gb: 4.0
+
+# Public competition implementations using this family of model commonly train
+# for roughly two dozen epochs. Keep this first run controlled rather than
+# immediately adding more architectural tricks.
+epochs: 24
+learning_rate: 0.0003
+weight_decay: 0.0001
+warmup_epochs: 1
+grad_clip: 1.0
+amp: true
+
+# For the clean BCE+Dice control we do not upweight positives inside BCE. Class
+# imbalance is addressed by foreground-biased crop sampling and Dice itself.
+pos_weight: 1.0
+
+# The current in-training PQ is a useful checkpoint selector for this benchmark.
+# Final model comparison should use the full held-out split before submission.
+selection_metric: pq
+val_every: 2
+val_tile: 1024
+val_max_images: 32
+instance_thresholds: 2
+thresholds: [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+
+model:
+  encoder: resnet34
+  pretrained: true
+  in_channels: 2
+
+  # depth is ignored by the ResNet encoder itself. It is set to 6 here because
+  # the legacy geometry preflight uses this value when checking 1024-pixel
+  # inputs; plain-U-Net mode contains no quadratic bottleneck attention.
+  depth: 6
+
+  bottleneck_attention: false
+  edge_attention: false
+  aux_heads: false
+  deep_supervision: false
+  dropout: 0.0
+
+loss:
+  bce: 0.5
+  dice: 0.5
+  tversky: 0.0
+  cl_dice: 0.0
+  focal: 0.0
+  spine: 0.0
+  boundary: 0.0
+  deep: 0.0
+  use_distance_weight: false

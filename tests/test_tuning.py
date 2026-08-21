@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +46,7 @@ def test_parameter_grid_skips_redundant_confidence_floors():
     assert (0.95, 0.97, 40.0, 1.2e-4) in grid
 
 
-def test_probability_cache_namespace_changes_with_inference_inputs(tmp_path):
+def test_probability_cache_namespace_reuses_across_subsets(tmp_path):
     checkpoint = tmp_path / "model.pt"
     checkpoint.write_bytes(b"checkpoint-a")
 
@@ -62,14 +63,14 @@ def test_probability_cache_namespace_changes_with_inference_inputs(tmp_path):
     base, _ = tune_postprocess.probability_cache_namespace(
         checkpoint, dataset, indices, 256, False
     )
+    subset, _ = tune_postprocess.probability_cache_namespace(
+        checkpoint, dataset, [0], 256, False
+    )
     tile_changed, _ = tune_postprocess.probability_cache_namespace(
         checkpoint, dataset, indices, 512, False
     )
     tta_changed, _ = tune_postprocess.probability_cache_namespace(
         checkpoint, dataset, indices, 256, True
-    )
-    split_changed, _ = tune_postprocess.probability_cache_namespace(
-        checkpoint, dataset, [0], 256, False
     )
 
     checkpoint.write_bytes(b"checkpoint-b")
@@ -77,4 +78,46 @@ def test_probability_cache_namespace_changes_with_inference_inputs(tmp_path):
         checkpoint, dataset, indices, 256, False
     )
 
-    assert len({base, tile_changed, tta_changed, split_changed, model_changed}) == 5
+    assert subset == base
+    assert len({base, tile_changed, tta_changed, model_changed}) == 4
+
+
+def test_duplicate_annotation_records_share_one_probability_filename():
+    dataset = SimpleNamespace(group_keys=["same-frame", "same-frame", "other-frame"])
+    first = tune_postprocess._record_cache_name(
+        tune_postprocess._record_cache_key(dataset, 0)
+    )
+    duplicate = tune_postprocess._record_cache_name(
+        tune_postprocess._record_cache_key(dataset, 1)
+    )
+    other = tune_postprocess._record_cache_name(
+        tune_postprocess._record_cache_key(dataset, 2)
+    )
+    assert first == duplicate
+    assert first != other
+
+
+def test_legacy_subset_cache_can_be_indexed_by_physical_image(tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint-a")
+    sha = tune_postprocess._file_sha256(checkpoint)
+
+    legacy = tmp_path / "best-oldsubset"
+    legacy.mkdir()
+    (legacy / "manifest.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_sha256": sha,
+                "tile_size": 256,
+                "tta": False,
+                "record_keys": ["ann-a|frame-a", "ann-b|frame-b"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (legacy / "00000.npy").write_bytes(b"a")
+    (legacy / "00001.npy").write_bytes(b"b")
+
+    found = tune_postprocess._legacy_probability_maps(tmp_path, sha, 256, False)
+    assert found["frame-a"] == legacy / "00000.npy"
+    assert found["frame-b"] == legacy / "00001.npy"

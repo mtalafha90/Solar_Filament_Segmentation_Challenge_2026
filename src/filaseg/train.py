@@ -87,12 +87,14 @@ class TrainConfig:
     instance_config: InstanceConfig = field(default_factory=InstanceConfig)
     """Post-processing used when validating, so validation matches submission."""
     instance_thresholds: int = 2
-    """How many thresholds to evaluate the costly instance metrics at.
+    """Diagnostic threshold cap used only for pixel-selected validation.
 
-    Two is enough: the threshold maximising Panoptic Quality is next to the one
-    maximising Dice, never far from it, and each extra candidate costs a full
-    instance extraction plus clDice and multi-scale IoU on every validation
-    frame -- about five seconds each at full resolution.
+    When ``selection_metric`` is ``matched_dice`` or ``pq``, every configured
+    threshold is evaluated with the instance metrics. Shortlisting those
+    thresholds by foreground Dice would reintroduce the exact metric mismatch
+    that produced the first poor leaderboard submission. When selecting on
+    foreground ``dice`` or ``iou``, this value limits the costly instance
+    diagnostics to the best few pixel thresholds.
     """
     val_max_images: int = 32
     """Cap on validation observations per epoch.
@@ -217,7 +219,7 @@ def validate(
     device: str,
     tile_size: int = 512,
     tta: bool = False,
-    selection_metric: str = "pq",
+    selection_metric: str = "matched_dice",
     instance_config: InstanceConfig | None = None,
     instance_thresholds: int = 3,
 ) -> dict[str, float]:
@@ -226,8 +228,8 @@ def validate(
     Validation runs on full disks, with the same post-processing a submission
     would use, because that is what the challenge measures. Patch-level numbers
     flatter a model that relies on every crop being centred on a filament, and
-    pixel-level numbers say nothing about whether filaments came out as single
-    objects -- which is half of what Panoptic Quality is measuring.
+    foreground pixel metrics say nothing about whether filaments came out as
+    single submitted objects.
 
     Args:
         model: The network to score.
@@ -239,8 +241,8 @@ def validate(
         tta: Apply test-time augmentation.
         selection_metric: Which metric picks the best threshold.
         instance_config: Post-processing settings.
-        instance_thresholds: How many of the best thresholds by pixel overlap to
-            evaluate the expensive instance metrics at.
+        instance_thresholds: Diagnostic instance thresholds when selecting on a
+            cheap pixel metric. Instance-selected runs evaluate every threshold.
 
     Returns:
         A flat dictionary of per-threshold and best-threshold scores.
@@ -250,13 +252,6 @@ def validate(
     instance_config = instance_config or InstanceConfig()
 
     per_threshold: dict[float, list[dict[str, float]]] = {t: [] for t in thresholds}
-
-    # Instance extraction is far more expensive than thresholding -- it
-    # skeletonises every component to decide what to merge -- so running it at
-    # every threshold on full-resolution frames would dominate the epoch. Pixel
-    # metrics are computed everywhere, and the instance metrics only at the few
-    # thresholds that look best by pixel overlap. The optimum of PQ is never far
-    # from the optimum of Dice, so this costs nothing in practice.
     cheap_key = "dice" if selection_metric != "iou" else "iou"
 
     # Only the probability maps are carried between the two passes, and as
@@ -273,22 +268,23 @@ def validate(
         probabilities.append(probability.astype(np.float16))
 
         for threshold in thresholds:
-            # Only the confusion-matrix metrics here: they are essentially free,
-            # and they are what ranks the thresholds. clDice and multi-scale IoU
-            # each cost about a second on a full-resolution frame and are
-            # reported rather than used for selection, so they wait for the
-            # short list.
             predicted = probability >= threshold
             per_threshold[threshold].append(
                 pixel_scores(predicted, prepared.mask, prepared.valid).as_dict()
             )
 
-    ranked = sorted(
-        thresholds,
-        key=lambda t: aggregate(per_threshold[t]).get(cheap_key, 0.0),
-        reverse=True,
-    )
-    candidates = ranked[: max(1, instance_thresholds)]
+    if selection_metric in ("matched_dice", "pq"):
+        # These metrics depend on the submitted instances themselves. Do not
+        # shortlist by foreground Dice: the first leaderboard experiment showed
+        # that foreground and instance optima can diverge materially.
+        candidates = list(thresholds)
+    else:
+        ranked = sorted(
+            thresholds,
+            key=lambda t: aggregate(per_threshold[t]).get(cheap_key, 0.0),
+            reverse=True,
+        )
+        candidates = ranked[: max(1, instance_thresholds)]
 
     # Attach instance metrics to the matching per-image records.
     for position, index in enumerate(indices):
@@ -320,11 +316,12 @@ def validate(
     }.get(selection_metric, "matched_dice")
     summary: dict[str, float] = {}
     best_threshold, best_value = candidates[0], -1.0
-    reported = ("iou", "dice", "cl_dice", "msiou", "precision", "recall",
-                "pq", "sq", "rq", "matched_dice", "mean_paired_dice")
+    reported = (
+        "iou", "dice", "cl_dice", "msiou", "precision", "recall",
+        "pq", "sq", "rq", "matched_dice", "mean_paired_dice",
+    )
     for threshold, records in per_threshold.items():
         merged = aggregate(records)
-        # Only thresholds carrying instance metrics can win on PQ.
         if key in ("pq", "matched_dice") and threshold not in candidates:
             for name in reported:
                 summary[f"{name}@{threshold:.2f}"] = merged.get(name, 0.0)
@@ -464,9 +461,7 @@ def train(config: TrainConfig) -> dict[str, float]:
                 # A fixed, evenly spaced subset, so the score is comparable
                 # between epochs rather than drifting with a random draw.
                 step = n_val / config.val_max_images
-                val_indices_used = [
-                    int(i * step) for i in range(config.val_max_images)
-                ]
+                val_indices_used = [int(i * step) for i in range(config.val_max_images)]
             else:
                 val_indices_used = list(range(n_val))
             try:

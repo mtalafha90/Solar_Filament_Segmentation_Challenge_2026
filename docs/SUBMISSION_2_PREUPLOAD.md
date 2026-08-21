@@ -82,6 +82,47 @@ Runtime and resource usage:
 
 The test prediction density (6.85 instances/image) closely matches the full-validation prediction density (6.96 instances/record) and is far below Baseline Submission 1 (2142 rows / 180 images = 11.9 instances/image). This is consistent with the intended reduction in small spurious/fragmented detections. Count agreement is a sanity check, not a scoring target.
 
+## Final round-trip integrity check
+
+The generated challenge CSV was decoded row-by-row before upload.
+
+```text
+SUBMISSION 2 INTEGRITY CHECK
+==================================================
+CSV rows                 : 1233
+Expected test images     : 180
+Images represented       : 178
+Images with no prediction: 2
+Duplicate filament IDs   : 0
+Unexpected image IDs     : 0
+Bad filament numbering   : 0
+Empty decoded masks      : 0
+Bad decoded shapes       : 0
+Minimum decoded area     : 541
+Maximum decoded area     : 69315
+No-detection images:
+   20200310113230Ch
+   20210811072510Th
+
+SUBMISSION 2 ROUND-TRIP CHECK: PASS
+```
+
+The two absent image IDs are intentional no-detection cases; challenge-format output contains no empty row for an image with zero predicted filaments. All 1233 encoded masks decoded to non-empty 2048×2048 masks, with unique and consecutively numbered filament IDs and no unexpected image IDs.
+
 ## Status
 
-**Pre-upload candidate.** Perform a round-trip challenge-CSV integrity check before Kaggle upload. Record the Kaggle public score only after the submission is accepted and scored.
+**READY FOR KAGGLE UPLOAD.**
+
+Upload artifact:
+
+```text
+runs/cpu_filanet_20epoch/submission_epoch20_postproc2.csv
+```
+
+Suggested Kaggle label:
+
+```text
+FilaNet CPU E20 | instance-tuned | thr0.93 | area2.3e-4 | gap40
+```
+
+Record the public leaderboard score here only after Kaggle accepts and scores the submission.

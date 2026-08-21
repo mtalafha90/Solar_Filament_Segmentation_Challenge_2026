@@ -8,7 +8,7 @@ This document records Kaggle submission artifacts and the exact experiment state
 
 ## Baseline Submission 1 — FilaNet CPU E20
 
-**Status:** submission CSV generated and verified; Kaggle upload / leaderboard score pending  
+**Status:** submitted and scored on Kaggle  
 **Recorded:** 2026-08-21 (Asia/Dubai)  
 **Submission label:** `FilaNet CPU E20 | patch256 | thr0.93 | no-TTA`
 
@@ -230,20 +230,44 @@ The checkpoint and JSON files are retained locally because they are needed for r
 | Checkpoint | `best.pt`, epoch 20 |
 | Threshold | 0.93 |
 | TTA | off |
-| Internal full-held-out Dice | 0.5391518818 |
-| Kaggle public score | **PENDING** |
-| Kaggle submission status | **PENDING** |
+| Internal full-held-out foreground Dice | 0.5391518818 |
+| Internal PQ diagnostic | 0.2274468798 |
+| Internal RQ diagnostic | 0.3500616269 |
+| Kaggle public score | **0.20** (user-reported; Kaggle display precision) |
+| Kaggle submission status | **Scored** |
 
-When Kaggle returns the score, update the final two fields rather than replacing the internal validation result. This preserves the distinction between local scientific validation and external competition evaluation.
+### Post-submission diagnosis
 
-### Interpretation before leaderboard submission
+The leaderboard result exposes an important validation mismatch. The internal **foreground-union Dice = 0.5392** is not measuring the same thing as the competition's per-filament overlap matching. Kaggle states that each submission row is one filament and that predicted and ground-truth segmentations are matched by actual overlap rather than by row index. The public leaderboard then reports a mean Dice score over about half of the test images.
 
-This submission is deliberately a **baseline**, not a final model. The full held-out evaluation shows that the semantic segmentation is learning meaningfully, but instance construction remains the major weakness:
+The observed public score of **0.20** is far closer to the local **PQ diagnostic = 0.2274** than to the foreground-union Dice of 0.5392. This does not prove that Kaggle is computing PQ; the published primary metric is Dice. Instead, it is strong evidence that the local foreground-union Dice hides the cost of incorrect instance construction. A fragmented prediction can cover much of the correct foreground when all components are unioned together, while still score poorly once each filament must be matched as an individual object.
 
-- spurious predictions: 818
-- one-to-many fragmentations: 146
-- many-to-one mergers: 20
-- missed filaments: 199
-- SQ (0.5764) is substantially higher than RQ (0.3501)
+This diagnosis is also consistent with the local full-validation error structure:
 
-The next optimization work should therefore test post-processing / instance-construction changes on the fixed epoch-20 checkpoint before assuming that longer training alone is the best use of CPU time. Future submissions should receive their own numbered section in this log so that leaderboard changes can be attributed to one controlled modification at a time.
+- **818 spurious predicted instances**
+- **146 one-to-many fragmentations**
+- **199 missed filaments**
+- only **20 many-to-one mergers**
+- `SQ = 0.5764` but `RQ = 0.3501`
+
+Therefore the immediate bottleneck is not simply insufficient pixel-level foreground overlap. The current semantic mask has meaningful signal, but the conversion from probability map to individual filament instances is substantially weaker.
+
+The test submission contained **2142 instances across 180 images (11.9/image)**. As an external point of comparison, a public Kaggle Mask R-CNN + U-Net-refiner notebook with a substantially stronger historical public score generated **1303 rows for the same 180 test images (~7.24/image)**. This is not a target count by itself, because different models may legitimately predict different numbers of filaments, but it supports testing whether the current pipeline is over-fragmenting the test masks.
+
+### Next controlled experiment
+
+Do **not** discard the epoch-20 checkpoint and do not assume that simply training longer will solve the leaderboard gap. First hold the network weights fixed and tune instance construction on the held-out data. The highest-value experiment is to cache the epoch-20 validation probability maps once, then sweep post-processing parameters without rerunning neural-network inference for every setting.
+
+Primary knobs to test from `InstanceConfig`:
+
+- `min_area_fraction`: remove small spurious components more aggressively
+- `merge_gap`: reconnect interrupted filament pieces
+- `merge_angle`: control how permissive fragment merging is
+- `closing_radius`: bridge small discontinuities before connected-component labeling
+- `fill_hole_area`: secondary cleanup parameter
+
+`reject_round` should remain off initially because existing experiments show that enabling it for a trained FilaNet can remove genuine compact filaments.
+
+The sweep should select settings primarily by an **instance-matched Dice proxy** aligned with the competition rather than by foreground-union Dice alone, while also reporting foreground Dice, recall, one-to-many, many-to-one, missed, spurious, PQ, and RQ. Only after the instance pipeline is improved should longer training or loss-weight ablations be compared.
+
+Future submissions should receive their own numbered section in this log so that leaderboard changes can be attributed to one controlled modification at a time.

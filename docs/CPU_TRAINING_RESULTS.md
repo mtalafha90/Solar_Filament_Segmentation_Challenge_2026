@@ -269,19 +269,69 @@ At threshold 0.95 the 12-observation training-time validation summary was:
 - missed count: 16
 - spurious count: 70
 
-The instance diagnostics suggest that, on this small validation subset, the current weakness is more associated with fragmentation/spurious components than with over-merging. These counts are diagnostic and must be re-evaluated on the complete held-out split before tuning post-processing around them.
+The instance diagnostics suggested that, on the small validation subset, fragmentation and spurious components were more important than over-merging. The full held-out run below confirms that pattern.
+
+## Full held-out validation
+
+The epoch-20 `best.pt` checkpoint was evaluated on the complete held-out split produced by the same grouped split logic used during training: 168 annotation records covering 106 distinct physical frames. Thresholds 0.90-0.98 were evaluated, with Dice used to select the operating point.
+
+### Threshold curve
+
+| Threshold | Dice | IoU | Precision | Recall |
+|---:|---:|---:|---:|---:|
+| 0.90 | 0.5354 | 0.3819 | 0.5086 | 0.6426 |
+| 0.92 | 0.5387 | 0.3849 | 0.5347 | 0.6146 |
+| **0.93** | **0.5392** | **0.3853** | **0.5497** | **0.5976** |
+| 0.94 | 0.5381 | 0.3841 | 0.5663 | 0.5777 |
+| 0.95 | 0.5347 | 0.3806 | 0.5843 | 0.5536 |
+| 0.96 | 0.5276 | 0.3735 | 0.6054 | 0.5233 |
+| 0.97 | 0.5141 | 0.3606 | 0.6306 | 0.4836 |
+| 0.98 | 0.4869 | 0.3351 | 0.6646 | 0.4255 |
+
+The full held-out optimum is threshold **0.93**. This differs only slightly from the 12-record training-time optimum of 0.95, and the headline Dice is effectively unchanged, which supports the representativeness of the small fixed validation subset for coarse checkpoint tracking.
+
+### Full held-out summary at threshold 0.93
+
+- Dice: **0.5391518818**
+- IoU: **0.3853039656**
+- Precision: **0.5497351129**
+- Recall: **0.5976305666**
+- clDice: **0.6072773555**
+- MSIoU: **0.3341070407**
+- PQ diagnostic: **0.2274468798**
+- SQ diagnostic: **0.5764129602**
+- RQ diagnostic: **0.3500616269**
+- one-to-many count: **146**
+- many-to-one count: **20**
+- missed count: **199**
+- spurious count: **818**
+
+The much larger spurious count relative to many-to-one events, together with 146 one-to-many events, confirms that the dominant instance-level failure mode is **over-fragmentation / excess components**, not aggressive merging. The low recognition-quality diagnostic (`RQ=0.3501`) compared with segmentation quality (`SQ=0.5764`) points in the same direction: when a prediction is matched, its overlap is substantially better than the pipeline's ability to produce the correct set of instances.
+
+### Full-validation execution cost
+
+- Wall time: **2 h 34 min 24 s**
+- Evaluation-reported elapsed time: **154.3 min**
+- User CPU time: **14,073.17 s**
+- System time: **2,664.70 s**
+- Average CPU utilization: **180%**
+- Peak resident memory: **3,232,564 kB (~3.23 GB)**
+- Swap: **0**
+- Exit status: **0**
+- Output summary: `runs/cpu_filanet_20epoch/full_val_summary.json`
 
 ## Current interpretation
 
 1. Full FilaNet is technically viable on the i7-5500U CPU at 256 px native-resolution crops.
-2. Memory is not the limiting factor: the 20-epoch run peaked at only ~3.11 GB resident memory and used no swap.
-3. Compute time is the limiting factor. The repository's full GPU-oriented default schedule would require several days on this CPU, so CPU experiments use smaller epoch sample budgets and less frequent validation.
-4. Real MAGFiLO learning is clearly present: the internal validation Dice increased from 0.0357 after the 32-crop smoke test, to 0.4399 for the calibrated 5-epoch checkpoint, to 0.5366 at epoch 20 on the 12-observation training validation subset.
-5. The 20-epoch learning curve does not yet show a convincing plateau; however, a longer run should not be launched until the best checkpoint is scored over the complete held-out split.
-6. The current Dice values are internal foreground-overlap validation values. They must not be reported as Kaggle leaderboard scores or as the exact organizer mean-Dice metric until the organizer matching/scoring implementation is verified.
+2. Memory is not the limiting factor: both training and full validation stay near 3.1-3.2 GB resident memory and use no swap.
+3. Compute time is the limiting factor. The 20-epoch training run required about 3 hours and the complete held-out validation another 2.6 hours on this CPU.
+4. Real MAGFiLO learning is clearly present: internal Dice increased from 0.0357 after the 32-crop smoke test, to 0.4399 for the calibrated 5-epoch checkpoint, to 0.5366 on the 12-record epoch-20 validation subset, and **0.5392 on the complete held-out split**.
+5. The 12-record validation subset was not strongly optimistic: the complete held-out Dice is slightly higher, while the optimum threshold shifts only from 0.95 to 0.93.
+6. The 20-epoch learning curve still does not show a convincing plateau, so additional training remains plausible; however, the full-set diagnostics show a clear instance-level bottleneck that should be investigated before simply spending more CPU time.
+7. The dominant diagnostic failure pattern is excess/spurious components and one-to-many fragmentation, with far fewer many-to-one mergers. Post-processing and instance construction should therefore be tuned before making merging more conservative.
+8. `SQ` substantially exceeds `RQ` on the full held-out split, indicating that matched objects are segmented better than objects are recognized/matched as distinct instances. This is a strong reason to focus the next experiment on instance post-processing rather than only on the semantic mask loss.
+9. The Dice values in this document are internal foreground-overlap validation values. They must **not** be reported as Kaggle leaderboard scores or as the exact organizer mean-Dice metric until the organizer matching/scoring implementation is verified.
 
-## Full held-out validation
+## Next experiment
 
-**Status: running / result pending.**
-
-The next evaluation reconstructs the same grouped split and scores `runs/cpu_filanet_20epoch/best.pt` on all held-out annotation records rather than the 12-record training-time cap. The planned threshold range is 0.90-0.98 around the calibrated optimum. The result from that run should be added here before deciding whether to continue training to 30-40 epochs or instead tune the loss/post-processing/instance behavior.
+Before starting a longer 30-40 epoch CPU training run, use the fixed epoch-20 checkpoint to sweep post-processing parameters on a representative held-out subset, with the explicit objective of reducing spurious components and one-to-many fragmentation without materially reducing Dice/recall. Candidate knobs should be selected from the implemented `InstanceConfig` and tested quantitatively; they should not be guessed from these aggregate counts alone. Once a post-processing setting is chosen, re-evaluate it on the full held-out split and only then decide whether longer training or loss-weight ablations are the higher-value next step.

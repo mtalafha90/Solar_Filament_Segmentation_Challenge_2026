@@ -51,6 +51,26 @@ class InstanceConfig:
     """Largest gap in pixels across which two fragments may be rejoined."""
     merge_angle: float = 45.0
     """Largest misalignment in degrees permitted when rejoining fragments."""
+    min_confidence: float = 0.0
+    """Drop instances whose mean predicted probability falls below this.
+
+    Area is a poor filter for spurious detections: a false positive can be as
+    large as a real filament. Confidence separates them well, because a genuine
+    filament has a core the model is sure about while a spurious component
+    typically sits just above the decision threshold across its whole extent.
+
+    Since the leaderboard matches predictions to ground truth per filament, an
+    unmatched prediction scores zero and drags the mean down directly, so
+    suppressing weak detections is worth more than it would be under a
+    foreground-union score. Set relative to ``threshold``: a value a little
+    above it removes the marginal components and keeps the confident ones.
+    """
+    min_peak_confidence: float = 0.0
+    """Drop instances whose single most confident pixel falls below this.
+
+    Complements ``min_confidence``: a long faint filament can have a low mean
+    while still containing a confident core, and this keeps it.
+    """
     reject_round: bool = False
     """Remove compact, round blobs, which are almost always sunspots.
 
@@ -356,6 +376,60 @@ def shape_descriptors(mask: np.ndarray) -> dict[str, float]:
     return {"area": area, "axis_ratio": axis_ratio, "roundness": roundness}
 
 
+def instance_confidence(
+    labels: np.ndarray, probability: np.ndarray
+) -> dict[int, tuple[float, float]]:
+    """Mean and peak predicted probability inside each labelled instance.
+
+    Computed with :func:`numpy.bincount` over the label map rather than by
+    masking each instance in turn, so the cost does not grow with the number of
+    instances on a full-resolution frame.
+
+    Returns:
+        A mapping from label to ``(mean_probability, peak_probability)``.
+    """
+    n_labels = int(labels.max())
+    if n_labels == 0:
+        return {}
+    flat_labels = labels.ravel()
+    flat_probability = probability.ravel().astype(np.float64)
+    counts = np.bincount(flat_labels, minlength=n_labels + 1)
+    totals = np.bincount(flat_labels, weights=flat_probability, minlength=n_labels + 1)
+    peaks = np.zeros(n_labels + 1, dtype=np.float64)
+    np.maximum.at(peaks, flat_labels, flat_probability)
+    return {
+        label: (
+            float(totals[label] / counts[label]) if counts[label] else 0.0,
+            float(peaks[label]),
+        )
+        for label in range(1, n_labels + 1)
+    }
+
+
+def reject_low_confidence(
+    labels: np.ndarray,
+    probability: np.ndarray,
+    min_confidence: float,
+    min_peak_confidence: float,
+) -> np.ndarray:
+    """Remove instances the model was not actually confident about."""
+    if min_confidence <= 0 and min_peak_confidence <= 0:
+        return labels
+    n_labels = int(labels.max())
+    if n_labels == 0:
+        return labels
+
+    confidence = instance_confidence(labels, probability)
+    keep = np.zeros(n_labels + 1, dtype=np.int32)
+    next_label = 1
+    for label in range(1, n_labels + 1):
+        mean_probability, peak = confidence.get(label, (0.0, 0.0))
+        if mean_probability >= min_confidence and peak >= min_peak_confidence:
+            keep[label] = next_label
+            next_label += 1
+    return keep[labels]
+
+
 def reject_compact(
     labels: np.ndarray,
     max_area: int = 900,
@@ -429,6 +503,14 @@ def extract_instances(
         return labels.astype(np.int32)
 
     labels = merge_collinear(labels, config.merge_gap, config.merge_angle)
+    # Confidence filtering comes after merging: a fragment of a real filament
+    # can look weak alone but is confident once rejoined to its body.
+    labels = reject_low_confidence(
+        labels,
+        np.asarray(probability, dtype=np.float32),
+        config.min_confidence,
+        config.min_peak_confidence,
+    )
     if config.reject_round:
         labels = reject_compact(labels, config.max_roundness_area, config.min_axis_ratio)
     return labels.astype(np.int32)

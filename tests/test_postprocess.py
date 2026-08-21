@@ -378,3 +378,54 @@ def test_a_wide_gap_is_bridged_only_at_the_matching_resolution():
 
         labels = extract_instances(probability, valid, InstanceConfig())
         assert labels.max() == 1, f"not rejoined at {size}px"
+
+
+def test_confidence_filtering_removes_marginal_instances():
+    """Area cannot separate these: the spurious blobs are as large as the real one."""
+    from filaseg.postprocess.instances import InstanceConfig, extract_instances
+
+    yy, xx = np.ogrid[:1024, :1024]
+    valid = ((yy - 512) ** 2 + (xx - 512) ** 2) <= 450**2
+    probability = np.zeros((1024, 1024), dtype=np.float32)
+    probability[500:508, 200:700] = 0.95   # confident filament
+    probability[300:308, 200:700] = 0.55   # marginal, same size
+    probability[700:706, 300:500] = 0.52   # marginal
+
+    assert extract_instances(probability, valid,
+                             InstanceConfig(threshold=0.5)).max() == 3
+    assert extract_instances(
+        probability, valid, InstanceConfig(threshold=0.5, min_confidence=0.6)
+    ).max() == 1
+
+
+def test_peak_confidence_keeps_a_faint_filament_with_a_confident_core():
+    from filaseg.postprocess.instances import InstanceConfig, extract_instances
+
+    yy, xx = np.ogrid[:1024, :1024]
+    valid = ((yy - 512) ** 2 + (xx - 512) ** 2) <= 450**2
+    probability = np.zeros((1024, 1024), dtype=np.float32)
+    probability[500:508, 200:700] = 0.55   # mostly faint
+    probability[502:506, 400:460] = 0.98   # but with a sure core
+
+    # A mean-only filter would discard it; the peak rule keeps it.
+    assert extract_instances(
+        probability, valid, InstanceConfig(threshold=0.5, min_confidence=0.7)
+    ).max() == 0
+    assert extract_instances(
+        probability, valid,
+        InstanceConfig(threshold=0.5, min_peak_confidence=0.9),
+    ).max() == 1
+
+
+def test_instance_confidence_reports_mean_and_peak():
+    from filaseg.postprocess.instances import instance_confidence
+
+    labels = np.zeros((64, 64), dtype=np.int32)
+    labels[:8, :8] = 1
+    probability = np.zeros((64, 64), dtype=np.float32)
+    probability[:8, :8] = 0.5
+    probability[0, 0] = 1.0
+
+    mean_probability, peak = instance_confidence(labels, probability)[1]
+    assert peak == pytest.approx(1.0)
+    assert 0.5 < mean_probability < 0.52

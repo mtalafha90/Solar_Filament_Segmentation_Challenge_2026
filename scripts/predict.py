@@ -60,6 +60,13 @@ def main() -> None:
     parser.add_argument("--no-tta", dest="tta", action="store_false")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--min-area", type=int, default=40, dest="min_area")
+    parser.add_argument("--min-confidence", type=float, default=0.0,
+                        dest="min_confidence",
+                        help="drop instances whose mean probability is below this; "
+                             "tune with scripts/tune_postprocess.py")
+    parser.add_argument("--min-area-fraction", type=float, default=1.2e-4,
+                        dest="min_area_fraction")
+    parser.add_argument("--merge-gap", type=float, default=18.0, dest="merge_gap")
     parser.add_argument("--save-labels", type=Path, dest="save_labels",
                         help="also write label maps as PNGs to this directory")
     args = parser.parse_args()
@@ -82,7 +89,13 @@ def main() -> None:
             threshold = stored_threshold
         print(f"loaded {args.checkpoint} (threshold {threshold:.2f})")
 
-    instance_config = InstanceConfig(threshold=threshold, min_area=args.min_area)
+    instance_config = InstanceConfig(
+        threshold=threshold,
+        min_area=args.min_area,
+        min_confidence=args.min_confidence,
+        min_area_fraction=args.min_area_fraction,
+        merge_gap=args.merge_gap,
+    )
     inference_config = InferenceConfig(
         tile_size=args.tile_size, tta=args.tta, device=args.device
     )

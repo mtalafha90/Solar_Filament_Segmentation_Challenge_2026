@@ -315,3 +315,47 @@ def test_aggregate_sums_panoptic_counts():
     assert merged["pq"] == pytest.approx(0.6)     # rates are averaged
     assert merged["pq_tp"] == pytest.approx(4)    # counts are summed
     assert merged["one_to_many"] == pytest.approx(2)
+
+
+def test_instance_dice_exposes_fragmentation_that_foreground_dice_hides():
+    """The gap between these two is where a leaderboard score disappears."""
+    from filaseg.metrics import instance_dice
+
+    def union(masks):
+        out = np.zeros((128, 128), dtype=bool)
+        for mask in masks:
+            out |= mask
+        return out
+
+    split = _segments(
+        (10, 20, 10, 45), (10, 20, 50, 90),
+        (40, 50, 10, 45), (40, 50, 50, 90),
+        (70, 80, 10, 45), (70, 80, 50, 90),
+    )
+    # Almost all the right pixels are covered...
+    assert pixel_scores(union(split), union(TRUTH)).dice > 0.95
+    # ...but not one filament is recovered as a single object.
+    assert instance_dice(split, TRUTH).matched_dice < 0.4
+
+
+def test_instance_dice_charges_spurious_predictions():
+    from filaseg.metrics import instance_dice
+
+    spurious = TRUTH + _segments(
+        (100, 110, 10, 40), (112, 120, 10, 40), (122, 128, 10, 40)
+    )
+    scores = instance_dice(spurious, TRUTH)
+    # Every true filament is found perfectly, so averaging over truth is blind
+    # to the extra predictions, while the headline reading is not.
+    assert scores.matched_dice_over_truth == pytest.approx(1.0)
+    assert scores.matched_dice < 0.6
+    assert scores.mean_paired_dice == pytest.approx(1.0)
+
+
+def test_instance_dice_edge_cases():
+    from filaseg.metrics import instance_dice
+
+    assert instance_dice([], []).matched_dice == pytest.approx(1.0)
+    assert instance_dice([], TRUTH).matched_dice == pytest.approx(0.0)
+    assert instance_dice(TRUTH, []).matched_dice == pytest.approx(0.0)
+    assert instance_dice(TRUTH, TRUTH).matched_dice == pytest.approx(1.0)

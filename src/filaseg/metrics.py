@@ -446,6 +446,9 @@ def evaluate(
     # over-merging behind it, so both are always computed.
     results.update(panoptic_quality(predictions, truths, match_threshold).as_dict())
     results.update(fragmentation(predictions, truths).as_dict())
+    # Per-filament Dice after overlap matching, which is what the leaderboard
+    # appears to measure; the unioned-foreground "dice" above is not the same.
+    results.update(instance_dice(predictions, truths).as_dict())
     return results
 
 
@@ -655,4 +658,99 @@ def fragmentation(
         missed=missed,
         spurious=spurious,
         fragments_per_split=float(split_counts.mean()) if split_counts.size else 0.0,
+    )
+
+
+# --------------------------------------------------------------------------
+# Instance-matched Dice: what the leaderboard appears to measure
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class MatchedDiceScores:
+    """Per-filament Dice after matching predictions to ground truth."""
+
+    matched_dice: float
+    """Mean Dice, charging unmatched predictions and unmatched truths as zero."""
+    matched_dice_over_truth: float
+    """Mean over ground-truth filaments only; ignores spurious predictions."""
+    matched_dice_over_pred: float
+    """Mean over predictions only; ignores missed filaments."""
+    mean_paired_dice: float
+    """Mean over matched pairs alone, so segmentation quality without counting."""
+    n_matched: int
+    n_predicted: int
+    n_truth: int
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "matched_dice": self.matched_dice,
+            "matched_dice_over_truth": self.matched_dice_over_truth,
+            "matched_dice_over_pred": self.matched_dice_over_pred,
+            "mean_paired_dice": self.mean_paired_dice,
+        }
+
+
+def instance_dice(
+    predictions: list[np.ndarray],
+    truths: list[np.ndarray],
+    match_threshold: float = 1e-6,
+) -> MatchedDiceScores:
+    """Dice computed per filament after matching by overlap.
+
+    The competition submits one row per filament and states that predictions
+    are matched to ground truth by actual overlap rather than by row order, then
+    reports a mean Dice. That is a very different quantity from the Dice of the
+    unioned foreground, and the difference is what a fragmenting model hides in:
+    a prediction broken into three pieces can cover the right pixels, and so
+    score well on the union, while every piece scores poorly as an object.
+
+    Four readings are returned because the exact denominator the organisers use
+    is not published, and they bracket it:
+
+    * ``matched_dice`` charges every unmatched prediction and every missed
+      filament as a zero, so it punishes over- and under-prediction alike. This
+      is the harshest reading and the one to optimise if unsure.
+    * ``matched_dice_over_truth`` averages over ground-truth filaments, so
+      spurious predictions cost nothing.
+    * ``matched_dice_over_pred`` averages over predictions, so missed filaments
+      cost nothing.
+    * ``mean_paired_dice`` averages over matched pairs only, and therefore
+      measures boundary quality with the counting removed.
+
+    Args:
+        predictions: One boolean mask per predicted filament.
+        truths: One boolean mask per annotated filament.
+        match_threshold: Minimum IoU for a pair to be considered at all.
+
+    Returns:
+        The :class:`MatchedDiceScores` for this observation.
+    """
+    n_pred, n_truth = len(predictions), len(truths)
+    if n_pred == 0 and n_truth == 0:
+        return MatchedDiceScores(1.0, 1.0, 1.0, 1.0, 0, 0, 0)
+    if n_pred == 0 or n_truth == 0:
+        return MatchedDiceScores(0.0, 0.0, 0.0, 0.0, 0, n_pred, n_truth)
+
+    iou = pairwise_iou_matrix(predictions, truths)
+    matches, _, _ = match_instances(iou, match_threshold)
+
+    paired: list[float] = []
+    for pred_index, true_index in matches:
+        overlap = iou[pred_index, true_index]
+        # Dice and IoU are monotonically related, so converting avoids
+        # recomputing the intersection over full-size masks.
+        paired.append(float(2.0 * overlap / (1.0 + overlap)))
+
+    total = float(sum(paired))
+    n_matched = len(paired)
+    unmatched = (n_pred - n_matched) + (n_truth - n_matched)
+    return MatchedDiceScores(
+        matched_dice=total / max(n_matched + unmatched, 1),
+        matched_dice_over_truth=total / max(n_truth, 1),
+        matched_dice_over_pred=total / max(n_pred, 1),
+        mean_paired_dice=total / max(n_matched, 1),
+        n_matched=n_matched,
+        n_predicted=n_pred,
+        n_truth=n_truth,
     )

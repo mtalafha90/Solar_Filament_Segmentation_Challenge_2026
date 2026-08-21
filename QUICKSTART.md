@@ -279,6 +279,13 @@ validation by `val_max_images`. Lower either if your machine is tight. Note that
 each DataLoader worker keeps its own cache, so `num_workers` multiplies nothing
 now, but it did before: if you are on a version older than this, upgrade.
 
+**Anything fails to import** — run the diagnostic first; it names the conflict
+and prints the fix rather than leaving you to read a symbol error:
+
+```bash
+python scripts/check_env.py
+```
+
 **`undefined symbol: ncclCommResume` (or a similar symbol) when importing torch**
 — an older NCCL is being loaded ahead of the one PyTorch's wheel bundles, which
 is what happens when conda-provided CUDA libraries mix with pip-provided ones.
@@ -303,7 +310,16 @@ pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu
 unset LD_LIBRARY_PATH
 ```
 
-Check with `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`.
+The quickest unblock is the CPU build, which carries no CUDA libraries at all
+and so cannot conflict. It is enough to run `tune_postprocess.py`, which is the
+step that pays off without retraining:
+
+```bash
+pip install --force-reinstall --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+```
+
+Check with `python scripts/check_env.py`.
 The tests skip the PyTorch-dependent modules rather than failing while this is
 broken, so `python -m pytest -q` still tells you the other 133 are fine.
 

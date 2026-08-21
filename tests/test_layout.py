@@ -701,3 +701,31 @@ def test_frame_cache_is_rebuilt_when_missing(tmp_path):
     rebuilt = dataset[0]
     assert np.allclose(rebuilt.image, original.image, atol=1e-3)
     assert np.array_equal(rebuilt.instances, original.instances)
+
+
+def test_environment_check_reports_every_dependency():
+    """scripts/check_env.py must name each requirement and its purpose."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import check_env
+
+    names = {module for module, _ in check_env.REQUIRED}
+    assert {"numpy", "scipy", "skimage", "torch", "pycocotools"} <= names
+    assert all(purpose for _, purpose in check_env.REQUIRED)
+
+    ok, detail = check_env.probe("numpy")
+    assert ok and detail
+    ok, detail = check_env.probe("a_module_that_does_not_exist")
+    assert not ok and "ModuleNotFoundError" in detail
+
+
+def test_environment_check_finds_duplicate_libraries_once(tmp_path):
+    """The library search must not list the same file twice."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import check_env
+
+    found = check_env.find_libraries("nccl")
+    assert len(found) == len(set(found))

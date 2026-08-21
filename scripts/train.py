@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument("--selection-metric", type=str, dest="selection_metric",
                         choices=("matched_dice", "pq", "dice", "iou"),
                         help="metric that picks the threshold and best checkpoint "
-                             "(default pq, the challenge's ranking metric)")
+                             "(default matched_dice, per-filament overlap matching)")
     parser.add_argument("--warmup-epochs", type=int, dest="warmup_epochs")
     parser.add_argument("--weight-decay", type=float, dest="weight_decay")
     parser.add_argument("--num-workers", type=int, dest="num_workers")

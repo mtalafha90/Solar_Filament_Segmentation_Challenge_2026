@@ -23,9 +23,49 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .metrics import pairwise_iou_matrix
-
 IOU_THRESHOLD = 0.5
+
+
+def independent_iou_matrix(
+    predictions: list[np.ndarray], truths: list[np.ndarray]
+) -> np.ndarray:
+    """Pairwise IoU without collapsing overlapping instances into label maps.
+
+    The organizer notebook evaluates independent RLE masks. That detail matters
+    when two GT annotations overlap: converting them to one integer label map
+    would overwrite pixels and change the IoUs. We use pycocotools when
+    available (the challenge submission format already depends on it) and keep
+    a small numpy fallback for unit tests/minimal environments.
+    """
+    n_pred, n_truth = len(predictions), len(truths)
+    if n_pred == 0 or n_truth == 0:
+        return np.zeros((n_pred, n_truth), dtype=np.float64)
+
+    try:
+        from pycocotools import mask as mask_utils
+
+        pred_rles = [
+            mask_utils.encode(np.asfortranarray(np.asarray(mask, dtype=np.uint8)))
+            for mask in predictions
+        ]
+        truth_rles = [
+            mask_utils.encode(np.asfortranarray(np.asarray(mask, dtype=np.uint8)))
+            for mask in truths
+        ]
+        return np.asarray(
+            mask_utils.iou(pred_rles, truth_rles, [0] * len(truth_rles)),
+            dtype=np.float64,
+        )
+    except ImportError:  # pragma: no cover - challenge env includes pycocotools
+        matrix = np.zeros((n_pred, n_truth), dtype=np.float64)
+        for i, prediction in enumerate(predictions):
+            p = np.asarray(prediction, dtype=bool)
+            for j, truth in enumerate(truths):
+                t = np.asarray(truth, dtype=bool)
+                intersection = int(np.count_nonzero(p & t))
+                union = int(np.count_nonzero(p | t))
+                matrix[i, j] = intersection / union if union else 0.0
+        return matrix
 
 
 @dataclass
@@ -91,8 +131,7 @@ class OfficialPQAccumulator:
             self.fn += n_truth
             return
 
-        # pairwise_iou_matrix returns (n_pred, n_truth).
-        iou = pairwise_iou_matrix(predictions, truths)
+        iou = independent_iou_matrix(predictions, truths)
         hit = iou > float(self.threshold)
 
         self.tp_ious.extend(iou[hit].astype(float).tolist())

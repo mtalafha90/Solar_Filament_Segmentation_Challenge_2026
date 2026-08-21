@@ -28,6 +28,18 @@ def test_split_is_disjoint_and_deterministic():
     assert len(val_a) == 4
 
 
+def test_grouped_split_never_leaks_a_physical_image():
+    """All annotation records for one physical frame must stay on one side."""
+    groups = ["a", "a", "b", "b", "b", "c", "d", "d", "e"]
+    train_indices, val_indices = split_ids(
+        len(groups), 0.4, seed=7, groups=groups
+    )
+    train_groups = {groups[i] for i in train_indices}
+    val_groups = {groups[i] for i in val_indices}
+    assert train_groups.isdisjoint(val_groups)
+    assert sorted(train_indices + val_indices) == list(range(len(groups)))
+
+
 def test_split_keeps_at_least_one_validation_image():
     _, val = split_ids(3, 0.01, seed=0)
     assert len(val) >= 1

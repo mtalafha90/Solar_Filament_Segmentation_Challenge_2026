@@ -1,4 +1,4 @@
-# Submission 2 pre-upload record — CPU E20 post-processing
+# Submission 2 result — CPU E20 post-processing
 
 **Date:** 2026-08-22 (Asia/Dubai)
 
@@ -109,9 +109,24 @@ SUBMISSION 2 ROUND-TRIP CHECK: PASS
 
 The two absent image IDs are intentional no-detection cases; challenge-format output contains no empty row for an image with zero predicted filaments. All 1233 encoded masks decoded to non-empty 2048×2048 masks, with unique and consecutively numbered filament IDs and no unexpected image IDs.
 
+## Kaggle result
+
+**Public leaderboard score: 0.21** (user-reported Kaggle display precision).
+
+For comparison:
+
+| submission | network | test instances | instances/image | public score |
+|---|---|---:|---:|---:|
+| Baseline Submission 1 | CPU E20 `best.pt` | 2142 | 11.90 | 0.20 |
+| Submission 2 | same CPU E20 `best.pt` | 1233 | 6.85 | **0.21** |
+
+The only material change between the two submissions was instance post-processing. Therefore the `0.20 -> 0.21` public-score increase shows that aggressive suppression/merging of small components helped only marginally on the current public grader. This is much smaller than the improvement in the local matched-Dice proxy and establishes that the current local proxy is not a sufficiently accurate surrogate for the Kaggle public metric.
+
+This result also argues against further broad tuning of threshold, merge gap and minimum area on the same checkpoint. Future work should prioritize (1) understanding/replicating the public scoring implementation as far as the organizers disclose it, and (2) improving the learned representation and instance formulation rather than spending CPU on additional morphology-only sweeps.
+
 ## Status
 
-**READY FOR KAGGLE UPLOAD.**
+**SUBMITTED AND SCORED.**
 
 Upload artifact:
 
@@ -119,10 +134,8 @@ Upload artifact:
 runs/cpu_filanet_20epoch/submission_epoch20_postproc2.csv
 ```
 
-Suggested Kaggle label:
+Kaggle label:
 
 ```text
 FilaNet CPU E20 | instance-tuned | thr0.93 | area2.3e-4 | gap40
 ```
-
-Record the public leaderboard score here only after Kaggle accepts and scores the submission.

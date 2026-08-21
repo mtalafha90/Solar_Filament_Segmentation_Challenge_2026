@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 from filaseg.losses import cl_dice_loss  # noqa: E402
 from filaseg.models.edge_attention import _edge_kernels  # noqa: E402
 from filaseg.models.filanet import FilaNetConfig, build_model  # noqa: E402
+from filaseg.train import TrainConfig  # noqa: E402
 
 
 def test_full_filanet_preserves_physical_edge_initialization():
@@ -45,7 +46,8 @@ def test_cldice_ignores_predictions_outside_valid_disk():
     assert noisy_loss.item() == pytest.approx(clean_loss.item(), abs=1e-7)
 
 
-def test_default_config_selects_dice():
-    """The shipped competition configuration must select checkpoints by Dice."""
+def test_default_config_selects_matched_dice():
+    """Both Python and YAML defaults must select by per-filament matched Dice."""
+    assert TrainConfig().selection_metric == "matched_dice"
     text = Path("configs/default.yaml").read_text(encoding="utf-8")
-    assert "selection_metric: dice" in text
+    assert "selection_metric: matched_dice" in text

@@ -21,6 +21,7 @@ from .metrics import (
     aggregate,
     cl_dice,
     fragmentation,
+    instance_dice,
     instance_masks_from_labels,
     multiscale_iou,
     panoptic_quality,
@@ -71,14 +72,17 @@ class TrainConfig:
     val_tile: int = 512
     thresholds: tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
     """Thresholds tried on the validation set; the best one is stored with the model."""
-    selection_metric: str = "pq"
+    selection_metric: str = "matched_dice"
     """Metric used to pick the threshold and the best checkpoint.
 
-    Defaults to Panoptic Quality, because that is what the challenge ranks on
-    and it is not interchangeable with pixel overlap: a model that splits every
-    filament in two can hold its Dice score while halving its PQ. Set to "dice"
-    for the other primary criterion, or "iou" for plain pixel overlap, which is
-    the cheapest to compute.
+    Defaults to per-filament Dice after overlap matching, because that is what
+    the leaderboard measures, and it is not interchangeable with the Dice of the
+    unioned foreground. A model that splits every filament in two scores 0.97 on
+    the union and 0.33 matched, so selecting on the union optimises the wrong
+    thing entirely.
+
+    Other options: "pq" for Panoptic Quality, "dice" for foreground Dice, "iou"
+    for plain pixel overlap.
     """
     instance_config: InstanceConfig = field(default_factory=InstanceConfig)
     """Post-processing used when validating, so validation matches submission."""
@@ -306,15 +310,22 @@ def validate(
                 panoptic_quality(predicted_instances, truth_instances).as_dict()
             )
             record.update(fragmentation(predicted_instances, truth_instances).as_dict())
+            record.update(instance_dice(predicted_instances, truth_instances).as_dict())
 
-    key = {"pq": "pq", "dice": "dice", "iou": "iou"}.get(selection_metric, "pq")
+    key = {
+        "matched_dice": "matched_dice",
+        "pq": "pq",
+        "dice": "dice",
+        "iou": "iou",
+    }.get(selection_metric, "matched_dice")
     summary: dict[str, float] = {}
     best_threshold, best_value = candidates[0], -1.0
-    reported = ("iou", "dice", "cl_dice", "msiou", "precision", "recall", "pq", "sq", "rq")
+    reported = ("iou", "dice", "cl_dice", "msiou", "precision", "recall",
+                "pq", "sq", "rq", "matched_dice", "mean_paired_dice")
     for threshold, records in per_threshold.items():
         merged = aggregate(records)
         # Only thresholds carrying instance metrics can win on PQ.
-        if key == "pq" and threshold not in candidates:
+        if key in ("pq", "matched_dice") and threshold not in candidates:
             for name in reported:
                 summary[f"{name}@{threshold:.2f}"] = merged.get(name, 0.0)
             continue
@@ -503,9 +514,9 @@ def train(config: TrainConfig) -> dict[str, float]:
         )
         if "val_best_pq" in record:
             message += (
-                f"  val PQ {record['val_best_pq']:.4f}"
-                f"  Dice {record.get('val_best_dice', 0):.4f}"
-                f"  IoU {record.get('val_best_iou', 0):.4f}"
+                f"  val mDice {record.get('val_best_matched_dice', 0):.4f}"
+                f"  PQ {record['val_best_pq']:.4f}"
+                f"  fgDice {record.get('val_best_dice', 0):.4f}"
                 f"  clDice {record.get('val_best_cl_dice', 0):.4f}"
                 f"  @thr {record['val_best_threshold']:.2f}"
             )

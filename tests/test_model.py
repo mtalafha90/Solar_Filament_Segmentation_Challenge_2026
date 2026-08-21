@@ -282,3 +282,80 @@ def test_summarise_predictions():
     assert summary["total_instances"] == 1
     assert summary["images_with_no_detection"] == 1
     assert summary["n_images"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Pretrained encoders
+# ---------------------------------------------------------------------------
+
+
+def test_first_convolution_adaptation_preserves_the_grey_response():
+    """Adapting an RGB encoder must not change what it sees in a grey image."""
+    from torch import nn
+
+    from filaseg.models.encoders import adapt_first_convolution
+
+    torch.manual_seed(0)
+    conv = nn.Conv2d(3, 16, 7, stride=2, padding=3, bias=False)
+    nn.init.kaiming_normal_(conv.weight)
+    grey = torch.randn(1, 1, 64, 64)
+
+    for channels in (1, 2, 4):
+        adapted = adapt_first_convolution(conv, channels)
+        assert adapted.weight.shape[1] == channels
+        original = conv(grey.repeat(1, 3, 1, 1))
+        new = adapted(grey.repeat(1, channels, 1, 1))
+        assert torch.allclose(original, new, atol=1e-4)
+
+
+def test_encoder_keeps_fine_detail_by_dropping_the_stem_pool():
+    """A standard ResNet stem loses thin structures in its first four pixels."""
+    from filaseg.models.encoders import ResNetEncoder
+
+    encoder = ResNetEncoder("resnet18", in_channels=2, pretrained=False)
+    assert encoder.downsampling == 16
+    features = encoder(torch.randn(1, 2, 256, 256))
+    assert len(features) == 5
+    # The finest skip is at half resolution, not a quarter.
+    assert features[0].shape[-2:] == (128, 128)
+    assert features[-1].shape[-2:] == (16, 16)
+
+    with_pool = ResNetEncoder("resnet18", in_channels=2, pretrained=False,
+                              keep_stem_pool=True)
+    assert with_pool.downsampling == 32
+
+
+def test_encoder_rejects_an_unknown_name():
+    from filaseg.models.encoders import ResNetEncoder
+
+    with pytest.raises(ValueError, match="unknown encoder"):
+        ResNetEncoder("not_a_model", pretrained=False)
+
+
+@pytest.mark.parametrize("encoder", ["resnet18", "resnet34"])
+def test_filanet_with_a_pretrained_encoder(encoder):
+    model = build_model(
+        FilaNetConfig(encoder=encoder, pretrained=False, n_heads=2)
+    )
+    outputs = model(torch.randn(1, 2, 256, 256))
+    # A full-resolution mask, despite the encoder's finest map being halved.
+    assert outputs["mask"].shape == (1, 1, 256, 256)
+    assert outputs["spine"].shape == (1, 1, 256, 256)
+
+    loss = (outputs["mask"].mean() + outputs["spine"].mean()
+            + outputs["boundary"].mean() + sum(d.mean() for d in outputs["deep"]))
+    loss.backward()
+    missing = [name for name, p in model.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient for {missing}"
+
+
+def test_filanet_rejects_an_unknown_encoder():
+    with pytest.raises(ValueError, match="unknown encoder"):
+        build_model(FilaNetConfig(encoder="mystery_net"))
+
+
+def test_scratch_encoder_is_unchanged():
+    """The default path must behave exactly as before."""
+    model = build_model(FilaNetConfig(base_width=8, depth=2, n_heads=2))
+    assert not model.pretrained_encoder
+    assert model(torch.randn(1, 2, 64, 64))["mask"].shape == (1, 1, 64, 64)

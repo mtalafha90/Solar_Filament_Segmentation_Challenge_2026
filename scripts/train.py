@@ -42,11 +42,16 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
     for name, value in vars(args).items():
         if name in ("config",) or value is None:
             continue
-        if name == "data_dir":
+        if name in ("data_dir", "encoder", "pretrained"):
             continue
         if name in TrainConfig.__dataclass_fields__:
             settings[name] = value
 
+    # Model-level flags are lifted out of the top-level namespace.
+    for name in ("encoder", "pretrained"):
+        value = getattr(args, name, None)
+        if value is not None:
+            model_settings[name] = value
     settings["model"] = FilaNetConfig(**model_settings)
     settings["loss"] = LossWeights(**loss_settings)
     known = set(TrainConfig.__dataclass_fields__)
@@ -81,8 +86,20 @@ def main() -> None:
                         help="share of crops centred on a filament (default 0.7)")
     parser.add_argument("--val-tile", type=int, dest="val_tile",
                         help="tile size used when validating on whole disks")
+    parser.add_argument("--val-max-images", type=int, dest="val_max_images",
+                        help="cap on validation frames per epoch; lower it if "
+                             "validation dominates the epoch time")
+    parser.add_argument("--val-every", type=int, dest="val_every")
+    parser.add_argument("--instance-thresholds", type=int, dest="instance_thresholds")
+    parser.add_argument("--cache-budget-gb", type=float, dest="cache_budget_gb")
+    parser.add_argument("--encoder", type=str,
+                        help="'scratch', or a pretrained backbone such as "
+                             "resnet34 (overrides the config's model.encoder)")
+    parser.add_argument("--no-pretrained", dest="pretrained", action="store_false",
+                        default=None,
+                        help="use the encoder architecture without ImageNet weights")
     parser.add_argument("--selection-metric", type=str, dest="selection_metric",
-                        choices=("pq", "dice", "iou"),
+                        choices=("matched_dice", "pq", "dice", "iou"),
                         help="metric that picks the threshold and best checkpoint "
                              "(default pq, the challenge's ranking metric)")
     parser.add_argument("--warmup-epochs", type=int, dest="warmup_epochs")

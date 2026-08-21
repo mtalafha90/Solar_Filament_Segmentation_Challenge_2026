@@ -48,3 +48,6 @@ dependencies:
       #   pip install --force-reinstall --no-cache-dir torch \
       #       --index-url https://download.pytorch.org/whl/cu124
       - torch>=2.0
+      # Pretrained encoder backbones, installed alongside torch so the two
+      # always match.
+      - torchvision>=0.15

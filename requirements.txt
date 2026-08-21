@@ -12,6 +12,8 @@ astropy>=5.3
 # Deep learning. Install the build that matches your CUDA version; see
 # https://pytorch.org/get-started/locally/
 torch>=2.0
+# Pretrained encoder backbones (model.encoder = resnet34, etc.)
+torchvision>=0.15
 
 # Required: the competition submission format is pycocotools compressed RLE,
 # and some COCO exports use it for annotations too

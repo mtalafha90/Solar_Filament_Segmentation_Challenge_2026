@@ -60,9 +60,16 @@ instance_thresholds: 2 # thresholds the costly instance diagnostics run at
 cache_budget_gb: 3.0
 
 model:
+  # MAGFiLO has about 700 distinct observations, which is little to learn
+  # general image features from. A pretrained encoder starts with edges and
+  # textures already represented and is the single largest improvement
+  # available; "scratch" reverts to the original from-scratch encoder.
+  encoder: resnet34
+  pretrained: true
+
   in_channels: 2           # flattened intensity + heliocentric-angle geometry
   base_width: 32
-  depth: 4                 # four downsamplings; deeper loses barbs
+  depth: 4                 # four downsamplings; ignored for pretrained encoders
   edge_channels: 32
   n_heads: 8
   dropout: 0.0
